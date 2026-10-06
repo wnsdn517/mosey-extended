@@ -147,14 +147,35 @@ channel. Limitation: `actframe` carries management/action frames only, not
 arbitrary data frames, so Option A may cover discovery but not the data
 plane.
 
-### Option B — patch the monitor TX path in bcmdhd
-Since the kernel is self-built and unsigned, `dhd_monitor_start` can be
-changed to hand the skb to the real TX path with the 802.11-frame flag
-(`BCMPCIE_PKT_FLAGS_FRAME_802_11`, present in `include/bcmmsgbuf.h`) instead
-of freeing it, i.e. a minimal in-tree monitor-injection patch rather than a
-full Nexmon firmware patch. Feasibility depends on whether the `_mon`
-firmware accepts an 802.11-framed TX descriptor. To be probed against the
-GoRhanHee source once Option A is settled.
+### Option B — patch the monitor TX path in bcmdhd (BLOCKED by flowrings)
+The obvious idea is to change `dhd_monitor_start` to forward the skb to the
+real TX path with the 802.11-frame flag (`BCMPCIE_PKT_FLAGS_FRAME_802_11`,
+already used on the RX side in `dhd_msgbuf.c:5868`) instead of freeing it.
+Reading the data TX path shows this **does not work as-is**:
+`dhd_prot_txdata()` requires a **flowring** per packet
+(`dhd_msgbuf.c:6853`, `flowid = DHD_PKT_GET_FLOWID(PKTBUF)`), and flowrings
+are created per `(ifidx, dest-MAC, prio)` bound to an **association**. A
+monitor injection frame has arbitrary 802.11 addresses and no association,
+so there is no flowring to carry it. This is precisely why Nexmon patches
+the **firmware** (below the flowring/msgbuf layer) rather than the driver.
+
+So driver-level monitor TX injection would require inventing a dedicated
+injection flowring or a firmware-level raw-TX path — substantial and
+firmware-dependent. It is **not** a small `dhd_monitor_start` edit.
+
+### Which TX path actually works
+
+| TX route | needs flowring? | arbitrary frames? | S10e |
+|----------|-----------------|-------------------|------|
+| data path (`dhd_prot_txdata`) | yes → needs association | — | ❌ no flowring for monitor frames |
+| `actframe` / control path (iovar) | no (goes via control ring) | action frames only | ✅ for AWDL sync/discovery |
+| Nexmon firmware patch | n/a (firmware level) | yes (all) | ⚠️ needs port to fw 18.41.117 |
+
+AWDL sync/discovery frames **are** action frames, so the discovery phase can
+go through the stock `actframe` control path (Option A) without touching
+firmware. Only the **data plane** needs Nexmon. The bridge should therefore
+classify daemon TX frames: action frames → `actframe`; data frames → Nexmon
+(or deferred).
 
 ## 5. Port architecture for S10e
 
@@ -168,8 +189,8 @@ GoRhanHee source once Option A is settled.
    │ wonder0  = renamed radiotap0 │   │ ART shim  (ioctl/nl80211)    │
    │  (stock _mon firmware)       │   │  ART_SET_CHAN -> chanspec    │
    │  RX  ✅ native                │   │  ART_GET_IF_ADDR-> cur_ether │
-   │  TX  ❌ -> Option A actframe  │   │  ART_TX_RATE/BSSID -> noop   │
-   │        or Option B patch     │   │                              │
+   │  TX  action->actframe (ctrl) │   │                              │
+   │      data  ->Nexmon (fw)     │   │                              │
    └─────────────────────────────┘   └──────────────────────────────┘
                  │                               │
                  ▼                               ▼
@@ -220,8 +241,10 @@ fully restores stock Wi-Fi.
 
 1. **Option A test** — `wlaf` action frame confirmed on-air by a second
    monitor device? Decides whether discovery works without a firmware patch.
-2. **Option B probe** — does the `_mon` firmware accept an 802.11-framed TX
-   descriptor, so `dhd_monitor_start` can inject instead of drop?
+2. **Data-plane TX** — driver monitor injection is blocked by flowrings
+   (see §4), so arbitrary-frame TX needs a Nexmon firmware patch ported to
+   fw 18.41.117 (base patch exists for 18.41.8.9 / Galaxy S20, same B1
+   chip). Scope only if discovery via `actframe` proves the concept.
 3. **ART shim** — implement the four ART commands (module or LD_PRELOAD)
    against the daemon once running on an Android-16 base.
 4. **wonder0 naming** — `ip link set radiotap0 name wonder0` vs. teaching the
