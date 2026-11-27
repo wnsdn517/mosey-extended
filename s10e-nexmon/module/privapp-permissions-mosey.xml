@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- S10 module copy. ro.control_privapp_permissions=enforce, so every privileged permission
+     requested by the shipped MoseyApp (60715, 1.0.980159239) must be listed or boot fails.
+     READ_WIFI_CREDENTIAL is denied: it was never granted in the tested setup. LOCAL_MAC_ADDRESS is
+     kept for older builds. -->
+<permissions>
+    <privapp-permissions package="com.google.android.mosey">
+        <permission name="android.permission.BLUETOOTH_PRIVILEGED"/>
+        <permission name="android.permission.LOCAL_MAC_ADDRESS"/>
+        <permission name="android.permission.MANAGE_WIFI_INTERFACES"/>
+        <permission name="android.permission.MANAGE_WIFI_NETWORK_SELECTION"/>
+        <permission name="android.permission.NETWORK_FACTORY"/>
+        <permission name="android.permission.CREATE_APP_SPECIFIC_NETWORK"/>
+        <permission name="android.permission.CONNECTIVITY_USE_RESTRICTED_NETWORKS"/>
+        <permission name="android.permission.LOCATION_HARDWARE"/>
+        <deny-permission name="android.permission.READ_WIFI_CREDENTIAL"/>
+    </privapp-permissions>
+</permissions>

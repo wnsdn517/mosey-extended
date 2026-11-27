@@ -1,0 +1,95 @@
+diff --git a/patches/bcm4375b1/18_41_117_sta/nexmon/src/injection.c b/patches/bcm4375b1/18_41_117_sta/nexmon/src/injection.c
+index 6cb4cefb..1f20a30f 100644
+--- a/patches/bcm4375b1/18_41_117_sta/nexmon/src/injection.c
++++ b/patches/bcm4375b1/18_41_117_sta/nexmon/src/injection.c
+@@ -45,30 +45,74 @@
+ #include <vendor_radiotap.h>    // vendor specific radiotap extensions
+ #include <local_wrapper.h>
+ 
++/* Injection rate and queue. The rate comes from the frame's radiotap RATE, MCS or VHT field, as on
++ * the other nexmon chips; frames without one go out at NEX_INJECT_RATE. NEX_INJECT_FIFO is the d11
++ * TX FIFO (0 BK, 1 BE, 2 VI, 3 VO): VO has the shortest channel access delay. */
++#ifndef NEX_INJECT_RATE
++#define NEX_INJECT_RATE RATES_RATE_54M
++#endif
++#ifndef NEX_INJECT_FIFO
++#define NEX_INJECT_FIFO 3
++#endif
++
++static uint32_t
++radiotap_ratespec(struct ieee80211_radiotap_header *rtap)
++{
++    struct ieee80211_radiotap_iterator it;
++    uint32_t rspec = 0;
++
++    if (ieee80211_radiotap_iterator_init(&it, rtap, rtap->it_len, 0))
++        return 0;
++    while (!ieee80211_radiotap_iterator_next(&it)) {
++        uint8_t *a = it.this_arg;
++        switch (it.this_arg_index) {
++            case IEEE80211_RADIOTAP_RATE:
++                if (!rspec && a[0])
++                    rspec = a[0];
++                break;
++            case IEEE80211_RADIOTAP_MCS:
++                /* known, flags, mcs. flags: bits 0-1 bandwidth (1 = 40), bit 2 short GI, bit 4 LDPC */
++                rspec = RATES_OVERRIDE_RATE | RATES_OVERRIDE_MODE | RATES_ENCODE_HT | (a[2] & 0x7f) |
++                        ((a[1] & 3) == 1 ? RATES_BW_40MHZ : RATES_BW_20MHZ) |
++                        ((a[1] & 4) ? RATES_SHORT_GI : 0) | ((a[1] & 0x10) ? RATES_LDPC_CODING : 0);
++                break;
++            case IEEE80211_RADIOTAP_VHT: {
++                /* known u16, flags, bandwidth, mcs_nss[4], coding, group_id, partial_aid */
++                uint8_t mcs = a[4] >> 4, nss = a[4] & 0xf, bw = a[3];
++                if (!nss)
++                    break;
++                rspec = RATES_OVERRIDE_RATE | RATES_OVERRIDE_MODE | RATES_ENCODE_VHT |
++                        RATES_VHT_NSS(nss) | RATES_VHT_MCS(mcs) |
++                        (bw >= 4 && bw <= 10 ? RATES_BW_80MHZ :
++                         bw >= 1 && bw <= 3 ? RATES_BW_40MHZ : RATES_BW_20MHZ) |
++                        ((a[2] & 4) ? RATES_SHORT_GI : 0) | ((a[8] & 1) ? RATES_LDPC_CODING : 0);
++                break;
++            }
++            default:
++                break;
++        }
++    }
++    return rspec;
++}
++
+ void *
+ inject_frame(struct wlc_info *wlc, struct sk_buff *p)
+ {
+-    uint32_t fifo = 0;
+-    uint32_t rate = RATES_RATE_6M;
++    struct ieee80211_radiotap_header *rtap_header = (struct ieee80211_radiotap_header *) p->data;
++    uint32_t rate;
+ 
+-    struct ieee80211_radiotap_header *rtap_header;
+-
+-    // parse radiotap header
+-    rtap_header = (struct ieee80211_radiotap_header *) p->data;
+-    
++    if (wlc->monitor == 0)
++        wlc = (struct wlc_info *) get_other_wlc(wlc);
+     if (wlc->monitor == 0) {
+-        wlc = (struct wlc_info*) get_other_wlc(wlc);
+-    }
+-
+-    if(wlc->monitor == 0) {
+         pkt_buf_free_skb(wlc->osh, p, 0);
+         return 0;
+-    }    
+-
+-    // remove radiotap header
+-    skb_pull(p, rtap_header->it_len);
++    }
+ 
+-    wlc_sendctl(wlc, p, wlc->active_queue, wlc->band->hwrs_scb, fifo, rate, 0);
++    rate = radiotap_ratespec(rtap_header);
++    if (!rate)
++        rate = NEX_INJECT_RATE;
+ 
++    skb_pull(p, rtap_header->it_len);
++    wlc_sendctl(wlc, p, wlc->active_queue, wlc->band->hwrs_scb, NEX_INJECT_FIFO, rate, 0);
+     return 0;
+ }

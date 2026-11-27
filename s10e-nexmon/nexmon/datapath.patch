@@ -1,0 +1,219 @@
+diff --git a/patches/bcm4375b1/18_41_117_sta/nexmon/src/datapath.c b/patches/bcm4375b1/18_41_117_sta/nexmon/src/datapath.c
+new file mode 100755
+index 00000000..7ffb66b9
+--- /dev/null
++++ b/patches/bcm4375b1/18_41_117_sta/nexmon/src/datapath.c
+@@ -0,0 +1,178 @@
++#pragma NEXMON targetregion "patch"
++
++#include <firmware_version.h>
++#include <wrapper.h>
++#include <structs.h>
++#include <helper.h>
++#include <patcher.h>
++#include <local_wrapper.h>
++
++/*
++ * Data-path injection (mosey). Host frames sent on the normal netdev TX path (bcmdhd flow rings)
++ * reach dngl_sendwl (0x1853C0), which hands a chain of packets to dev->ops->xmit (wl_send) with
++ * "blx r6" at 0x18545A. While monitor mode is on, packets that start with a radiotap header are
++ * injected instead. Everything else goes to wl_send unchanged.
++ *
++ * Host packets are lfrags: only the first p->len bytes (the 14-byte "ethernet header") are in
++ * dongle memory, the rest stays in host memory (address at +0x44/+0x48, length at +0x54).
++ * hnd_pktfetch (0x1D4630) DMAs that host part into a new dongle lbuf; the completion callback
++ * prepends the inline bytes and injects the rebuilt frame, then frees the lfrag (which releases
++ * the host buffer through the normal tx-status path).
++ *
++ * Packets in the chain are linked by 16-bit ids at offset 0x1A, resolved through the packet
++ * table whose address is stored at 0x1701A4 (same lookup as dngl_sendwl).
++ */
++
++typedef int (*xmit_fn)(void *src, void *dev, struct sk_buff *p);
++
++struct wlc_info *nex_wlc = 0;             /* set by wlc_ioctl_hook */
++/* calls, fetch queued, fetch failed, cb ok, cb cancelled, last inline|host len << 16,
++ * non-radiotap dropped, injected */
++unsigned int nex_dp_stat[8] = { 0 };
++
++void *inject_frame(struct wlc_info *wlc, struct sk_buff *p);
++
++#define PKT_TABLE_PTR   0x1701A4
++#define LFRAG_HOSTLEN(p) (*(unsigned short *) ((unsigned char *) (p) + 0x54))
++#define FETCH_HEADROOM  256               /* TXOFF (204) + inline bytes */
++
++struct pktfetch_info {
++    void *osh;
++    void *lfrag;
++    unsigned short headroom;
++    short host_offset;
++    void (*cb)(struct sk_buff *lb, struct sk_buff *orig, void *ctx, int cancelled);
++    void *ctx;
++    void *next;
++};
++
++struct fetch_ctx {
++    struct pktfetch_info *pinfo;
++};
++
++#define fw_mallocz(n)       ((void *(*)(unsigned int)) 0x61305)(n)
++#define fw_free(p)          ((void (*)(void *)) 0x61335)(p)
++#define fw_pktfetch(pi)     ((int (*)(struct pktfetch_info *)) 0x1D4631)(pi)
++#define fw_pkt_free(o, p, s) ((void (*)(void *, void *, int)) 0x186EC9)(o, p, s)
++
++static int
++is_radiotap(const unsigned char *d, unsigned int len)
++{
++    unsigned int rl;
++
++    if (len < 8)
++        return 0;
++    rl = d[2] | (d[3] << 8);
++    return d[0] == 0 && d[1] == 0 && rl >= 8 && rl <= 64;
++}
++
++static void
++fetch_done(struct sk_buff *lb, struct sk_buff *orig, void *ctx, int cancelled)
++{
++    struct fetch_ctx *fc = (struct fetch_ctx *) ctx;
++    struct wlc_info *wlc = nex_wlc;
++
++    if (fc) {
++        fw_free(fc->pinfo);
++        fw_free(fc);
++    }
++    if (cancelled || !lb || !orig || !wlc) {
++        nex_dp_stat[4]++;
++        return;
++    }
++    nex_dp_stat[3]++;
++    skb_push(lb, orig->len);
++    memcpy(lb->data, orig->data, orig->len);
++    fw_pkt_free(wlc->osh, orig, 1);
++    if (is_radiotap((unsigned char *) lb->data, lb->len)) {
++        nex_dp_stat[7]++;
++        inject_frame(wlc, lb);
++    } else {
++        fw_pkt_free(wlc->osh, lb, 0);
++    }
++}
++
++static void
++inject_host(struct wlc_info *wlc, struct sk_buff *p)
++{
++    struct pktfetch_info *pi;
++    struct fetch_ctx *fc;
++    unsigned int hl = LFRAG_HOSTLEN(p);
++
++    nex_dp_stat[5] = p->len | hl << 16;
++    if (hl == 0) {                        /* whole frame already in dongle memory */
++        nex_dp_stat[7]++;
++        inject_frame(wlc, p);
++        return;
++    }
++    if (p->len > 64)
++        goto drop;
++    pi = fw_mallocz(sizeof(*pi));
++    fc = fw_mallocz(sizeof(*fc));
++    if (!pi || !fc) {
++        if (pi) fw_free(pi);
++        if (fc) fw_free(fc);
++        goto drop;
++    }
++    fc->pinfo = pi;
++    pi->osh = wlc->osh;
++    pi->lfrag = p;
++    pi->headroom = FETCH_HEADROOM;
++    pi->host_offset = 0;
++    pi->cb = fetch_done;
++    pi->ctx = fc;
++    if (fw_pktfetch(pi) == 0) {
++        nex_dp_stat[1]++;
++        return;
++    }
++    fw_free(pi);
++    fw_free(fc);
++drop:
++    nex_dp_stat[2]++;
++    fw_pkt_free(wlc->osh, p, 1);
++}
++
++int
++dngl_xmit_hook(void *src, void *dev, struct sk_buff *p, xmit_fn xmit)
++{
++    struct wlc_info *wlc = nex_wlc;
++    struct sk_buff **table;
++
++    if (!wlc || (!wlc->monitor && !((struct wlc_info *) get_other_wlc(wlc))->monitor))
++        return xmit(src, dev, p);
++
++    table = *(struct sk_buff ***) PKT_TABLE_PTR;
++    while (p) {
++        unsigned short next_id = p->field1A;
++        struct sk_buff *next = next_id ? table[next_id] : 0;
++
++        nex_dp_stat[0]++;
++        p->field1A = 0;
++        if (is_radiotap((unsigned char *) p->data, p->len)) {
++            inject_host(wlc, p);
++        } else {
++            /* ordinary host traffic while the station is down for monitor mode: wl_send would
++             * reject it without freeing it, and leaked lfrags stall the flow rings */
++            nex_dp_stat[6]++;
++            fw_pkt_free(wlc->osh, p, 1);
++        }
++        p = next;
++    }
++    return 0;
++}
++
++/* Replaces "mov r2, sl; blx r6" in dngl_sendwl: r0 = src, r1 = dev, sl = packet chain,
++ * r6 = wl_send. Returns to the instruction after the blx with the result in r0. */
++__attribute__((naked))
++void
++dngl_xmit_stub(void)
++{
++    asm(
++        "mov r2, sl\n"
++        "mov r3, r6\n"
++        "b dngl_xmit_hook\n"
++    );
++}
++
++__attribute__((at(0x185458, "", CHIP_VER_BCM4375b1, FW_VER_18_41_117_sta)))
++BLPatch(dngl_xmit_stub, dngl_xmit_stub);
+diff --git a/patches/bcm4375b1/18_41_117_sta/nexmon/src/ioctl.c b/patches/bcm4375b1/18_41_117_sta/nexmon/src/ioctl.c
+index 43c74bcc..cb711246 100644
+--- a/patches/bcm4375b1/18_41_117_sta/nexmon/src/ioctl.c
++++ b/patches/bcm4375b1/18_41_117_sta/nexmon/src/ioctl.c
+@@ -68,6 +68,8 @@ struct inject_frame {
+ };
+ 
+ void *inject_frame(struct wlc_info *wlc, struct sk_buff *p);
++extern struct wlc_info *nex_wlc;
++extern unsigned int nex_dp_stat[8];
+ 
+ uint8_t eapol1[] = {
+   0x08, 0x02, 0x3a, 0x01, 0x82, 0x3e, 0x7a, 0x30, 0x6c, 0xa8, 0x64, 0x66,
+@@ -216,6 +218,7 @@ wlc_ioctl_hook(struct wlc_info *wlc, int cmd, char *arg, int len, void *wlc_if)
+ 
+     int ret = IOCTL_ERROR;
+     argprintf_init(arg, len);
++    nex_wlc = wlc;
+ 
+     switch (cmd) {
+         case NEX_INJECT_FRAME:
+@@ -276,6 +279,13 @@ wlc_ioctl_hook(struct wlc_info *wlc, int cmd, char *arg, int len, void *wlc_if)
+             break;
+         }
+ 
++        case 0x614:
++            if (len >= (int) sizeof(nex_dp_stat)) {
++                memcpy(arg, nex_dp_stat, sizeof(nex_dp_stat));
++                ret = IOCTL_SUCCESS;
++            }
++            break;
++
+         case WLC_SET_MONITOR:
+         case 0x613:
+         {

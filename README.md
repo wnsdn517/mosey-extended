@@ -1,3 +1,6 @@
+> **Galaxy S10 (Exynos) port:** see [`s10e-nexmon/`](s10e-nexmon/), module "Quick Share AirDrop for S10".  
+> Forked from [thelok1s/mosey-extended](https://github.com/thelok1s/mosey-extended) by lok1s and contributors.
+
 > [!WARNING]
 > This project is independent and not affiliated with, authorized, or endorsed by Google LLC or Apple Inc.  
 > All trademarks (including Android, Google, and AirDrop) belong to their respective owners.

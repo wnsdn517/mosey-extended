@@ -1,0 +1,29 @@
+# KernelSU sepolicy.rule (magiskpolicy syntax: "allow SRC TGT CLASS PERMS", no ':' or ';').
+# Check changes with `ksud sepolicy check`.
+#
+# mosey_server is started by the module's service.sh and runs in the root manager domain
+# (the LD_PRELOAD shim rules out an init service), so the rules target it.
+# customize.sh replaces the ROOTDOM placeholder with that domain (ksu or magisk)
+
+# Label for com.google.pixel.moseyservice.IMoseyService/default (vendor_service_contexts)
+type mosey_service
+typeattribute mosey_service service_manager_type
+typeattribute mosey_service hal_service_type
+
+# mosey_server (@ROOTDOM@) <-> servicemanager
+allow @ROOTDOM@ mosey_service service_manager { add find }
+allow @ROOTDOM@ servicemanager binder { call transfer }
+allow servicemanager @ROOTDOM@ binder { call transfer }
+allow servicemanager @ROOTDOM@ dir search
+allow servicemanager @ROOTDOM@ file { read open }
+allow servicemanager @ROOTDOM@ process getattr
+
+# Clients: GMS / Quick Share / MoseyApp (all appdomain) and system_server
+allow appdomain mosey_service service_manager find
+allow system_server mosey_service service_manager find
+allow appdomain @ROOTDOM@ binder { call transfer }
+allow @ROOTDOM@ appdomain binder { call transfer }
+allow appdomain @ROOTDOM@ fd use
+
+allow system_server @ROOTDOM@ binder { call transfer }
+allow @ROOTDOM@ system_server binder { call transfer }
