@@ -1,4 +1,4 @@
-> **Galaxy S10 (Exynos) port:** see [`s10e-nexmon/`](s10e-nexmon/), module "Quick Share AirDrop for S10".  
+> **Galaxy S10 (Exynos) port:** [Quick Share AirDrop for S10](s10e-nexmon/README.md): requirements, install, speed and troubleshooting.  
 > Forked from [thelok1s/mosey-extended](https://github.com/thelok1s/mosey-extended) by lok1s and contributors.
 
 > [!WARNING]

@@ -35,6 +35,7 @@ while :; do
   stale=$((stale + 1)) d=15
   [ $stale -lt 2 ] && continue
   "$WL" set 0x613 0 >/dev/null 2>&1
+  "$WL" set 116 0 >/dev/null 2>&1     # scans were suppressed with it
   [ -e $DPLINK ] && echo 0 > $DPLINK
   echo "$(date '+%m-%d %H:%M:%S') [mosey-s10e] monwatch: disarmed stale monitor (was $((v & 255)), now $("$WL" get 107))" >> $LOGDIR/service.log
   sh $MODDIR/report.sh "stale monitor mode disarmed" >/dev/null

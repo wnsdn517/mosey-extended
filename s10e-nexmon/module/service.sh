@@ -59,7 +59,8 @@ if [ -f $LOGDIR/dp_busy ] ||
 fi
 if [ -f $LOGDIR/dp_busy ]; then
   uname -r > $SLOW; rm -f $LOGDIR/dp_busy
-  log "WARNING: last boot ended while fast transfer was in use - slow mode pinned"
+  echo off > $LOGDIR/amsdu    # frame bundling stays off until the module is installed again
+  log "WARNING: last boot ended while fast transfer was in use - slow mode pinned, A-MSDU off"
 fi
 if [ "$RADIO" = 1 ] && [ -f "$KO" ] && [ ! -e $DPLINK ] &&
    [ "$(cat $SLOW 2>/dev/null)" != "$(uname -r)" ]; then
@@ -106,8 +107,8 @@ supervise() {
     rc=$?
     up=$(( $(date +%s) - t0 ))
     # moseynex disarms itself only while it runs. If it died, monitor mode stays armed and blocks
-    # 5 GHz STA, so disarm here.
-    [ "$RADIO" = 1 ] && "$WL" set 0x613 0 >/dev/null 2>&1
+    # 5 GHz STA, and Wi-Fi scans stay suppressed, so undo both here.
+    [ "$RADIO" = 1 ] && "$WL" set 0x613 0 >/dev/null 2>&1 && "$WL" set 116 0 >/dev/null 2>&1
     [ -e $DPLINK ] && echo 0 > $DPLINK
     rm -f $LOGDIR/dp_busy     # only the daemon exited, the phone did not go down
     log "mosey_server exited rc=$rc after ${up}s"

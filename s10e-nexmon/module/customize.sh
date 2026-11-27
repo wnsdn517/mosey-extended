@@ -67,7 +67,8 @@ else
 fi
 ui_print "[4/4] Installing"
 rm -f /data/adb/mosey-extended/boot_count /data/adb/mosey-extended/bootloop
-rm -f /data/adb/mosey-extended/slow_mode /data/adb/mosey-extended/dp_busy   # try fast mode again
+# try fast mode and frame bundling again
+rm -f /data/adb/mosey-extended/slow_mode /data/adb/mosey-extended/dp_busy /data/adb/mosey-extended/amsdu
 ui_print "  Fast transfer is used if this kernel accepts it, otherwise slow mode"
 # SELinux: mosey_server runs in the root manager's own domain (ksu / magisk / ...)
 dom=$(cut -d: -f3 /proc/self/attr/current 2>/dev/null)

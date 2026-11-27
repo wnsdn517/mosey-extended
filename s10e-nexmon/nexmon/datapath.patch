@@ -1,9 +1,9 @@
 diff --git a/patches/bcm4375b1/18_41_117_sta/nexmon/src/datapath.c b/patches/bcm4375b1/18_41_117_sta/nexmon/src/datapath.c
 new file mode 100755
-index 00000000..7ffb66b9
+index 0000000..b86ef4a
 --- /dev/null
 +++ b/patches/bcm4375b1/18_41_117_sta/nexmon/src/datapath.c
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,234 @@
 +#pragma NEXMON targetregion "patch"
 +
 +#include <firmware_version.h>
@@ -41,6 +41,10 @@ index 00000000..7ffb66b9
 +#define PKT_TABLE_PTR   0x1701A4
 +#define LFRAG_HOSTLEN(p) (*(unsigned short *) ((unsigned char *) (p) + 0x54))
 +#define FETCH_HEADROOM  256               /* TXOFF (204) + inline bytes */
++#define AMSDU_HEAD      0xa1
++#define AMSDU_TAIL      0xa2
++#define AMSDU_MID       0xa3
++#define LBUF_NEXTID     0x18
 +
 +struct pktfetch_info {
 +    void *osh;
@@ -69,7 +73,61 @@ index 00000000..7ffb66b9
 +    if (len < 8)
 +        return 0;
 +    rl = d[2] | (d[3] << 8);
-+    return d[0] == 0 && d[1] == 0 && rl >= 8 && rl <= 64;
++    /* d[1]: radiotap pad, used by the host to mark the halves of an A-MSDU pair */
++    return d[0] == 0 && (d[1] == 0 || (d[1] >= AMSDU_HEAD && d[1] <= AMSDU_MID)) &&
++           rl >= 8 && rl <= 64;
++}
++
++/* The host cannot send frames over 1600 bytes, and one dongle buffer holds under 2000. An A-MSDU
++ * therefore arrives as two packets: the head (radiotap, 802.11 header, first subframe with its
++ * padding) and the tail (8 byte marker, second subframe). The tail buffer is chained to the head
++ * (lbuf nextid) and the chain goes out as one frame. */
++static struct sk_buff *amsdu_head = 0;
++static struct sk_buff *amsdu_last = 0;      /* end of the chain being collected */
++unsigned int nex_amsdu_stat[3] = { 0 };     /* pairs sent, heads dropped, tails dropped */
++
++static void
++emit(struct wlc_info *wlc, struct sk_buff *lb)
++{
++    unsigned char *d = (unsigned char *) lb->data;
++
++    if (d[1] == AMSDU_HEAD) {
++        if (amsdu_head) {
++            nex_amsdu_stat[1]++;
++            fw_pkt_free(wlc->osh, amsdu_head, 0);
++        }
++        amsdu_head = amsdu_last = lb;
++        return;
++    }
++    if (d[1] == AMSDU_TAIL || d[1] == AMSDU_MID) {
++        struct sk_buff *head = amsdu_head;
++        struct sk_buff **table = *(struct sk_buff ***) PKT_TABLE_PTR;
++        unsigned short id = *(unsigned short *) lb;
++
++        if (!head || table[id] != lb) {
++            nex_amsdu_stat[2]++;
++            amsdu_head = 0;
++            if (head)
++                fw_pkt_free(wlc->osh, head, 0);
++            fw_pkt_free(wlc->osh, lb, 0);
++            return;
++        }
++        int more = d[1] == AMSDU_MID;
++        skb_pull(lb, 8);
++        *(unsigned short *) ((unsigned char *) amsdu_last + LBUF_NEXTID) = id;
++        if (more) {
++            amsdu_last = lb;
++            return;
++        }
++        amsdu_head = 0;
++        ((unsigned char *) head->data)[1] = 0;
++        nex_amsdu_stat[0]++;
++        nex_dp_stat[7]++;
++        inject_frame(wlc, head);
++        return;
++    }
++    nex_dp_stat[7]++;
++    inject_frame(wlc, lb);
 +}
 +
 +static void
@@ -91,8 +149,7 @@ index 00000000..7ffb66b9
 +    memcpy(lb->data, orig->data, orig->len);
 +    fw_pkt_free(wlc->osh, orig, 1);
 +    if (is_radiotap((unsigned char *) lb->data, lb->len)) {
-+        nex_dp_stat[7]++;
-+        inject_frame(wlc, lb);
++        emit(wlc, lb);
 +    } else {
 +        fw_pkt_free(wlc->osh, lb, 0);
 +    }
@@ -107,8 +164,7 @@ index 00000000..7ffb66b9
 +
 +    nex_dp_stat[5] = p->len | hl << 16;
 +    if (hl == 0) {                        /* whole frame already in dongle memory */
-+        nex_dp_stat[7]++;
-+        inject_frame(wlc, p);
++        emit(wlc, p);
 +        return;
 +    }
 +    if (p->len > 64)
@@ -183,19 +239,20 @@ index 00000000..7ffb66b9
 +__attribute__((at(0x185458, "", CHIP_VER_BCM4375b1, FW_VER_18_41_117_sta)))
 +BLPatch(dngl_xmit_stub, dngl_xmit_stub);
 diff --git a/patches/bcm4375b1/18_41_117_sta/nexmon/src/ioctl.c b/patches/bcm4375b1/18_41_117_sta/nexmon/src/ioctl.c
-index 43c74bcc..cb711246 100644
+index 43c74bc..63eb314 100644
 --- a/patches/bcm4375b1/18_41_117_sta/nexmon/src/ioctl.c
 +++ b/patches/bcm4375b1/18_41_117_sta/nexmon/src/ioctl.c
-@@ -68,6 +68,8 @@ struct inject_frame {
+@@ -68,6 +68,9 @@ struct inject_frame {
  };
  
  void *inject_frame(struct wlc_info *wlc, struct sk_buff *p);
 +extern struct wlc_info *nex_wlc;
 +extern unsigned int nex_dp_stat[8];
++extern unsigned int nex_amsdu_stat[3];
  
  uint8_t eapol1[] = {
    0x08, 0x02, 0x3a, 0x01, 0x82, 0x3e, 0x7a, 0x30, 0x6c, 0xa8, 0x64, 0x66,
-@@ -216,6 +218,7 @@ wlc_ioctl_hook(struct wlc_info *wlc, int cmd, char *arg, int len, void *wlc_if)
+@@ -216,6 +219,7 @@ wlc_ioctl_hook(struct wlc_info *wlc, int cmd, char *arg, int len, void *wlc_if)
  
      int ret = IOCTL_ERROR;
      argprintf_init(arg, len);
@@ -203,10 +260,18 @@ index 43c74bcc..cb711246 100644
  
      switch (cmd) {
          case NEX_INJECT_FRAME:
-@@ -276,6 +279,13 @@ wlc_ioctl_hook(struct wlc_info *wlc, int cmd, char *arg, int len, void *wlc_if)
+@@ -276,6 +280,21 @@ wlc_ioctl_hook(struct wlc_info *wlc, int cmd, char *arg, int len, void *wlc_if)
              break;
          }
  
++        case 0x61A:   /* A-MSDU support: magic, pairs sent, heads dropped, tails dropped */
++            if (len >= 16) {
++                unsigned int r[4] = { 0x414d5333, nex_amsdu_stat[0], nex_amsdu_stat[1], nex_amsdu_stat[2] };
++                memcpy(arg, r, sizeof(r));
++                ret = IOCTL_SUCCESS;
++            }
++            break;
++
 +        case 0x614:
 +            if (len >= (int) sizeof(nex_dp_stat)) {
 +                memcpy(arg, nex_dp_stat, sizeof(nex_dp_stat));

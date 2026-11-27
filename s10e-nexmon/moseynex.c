@@ -24,6 +24,8 @@
  *   MOSEYNEX_MIN_VHT_MCS  floor for mosey's VHT data MCS   (default 5, 0 = mosey's choice)
  *   MOSEYNEX_FFI       fallback libmosey_daemon_ffi.so    (default: none)
  *   /data/adb/mosey-extended/tx_rate  optional "VHT <mcs> <nss> [sgi]" override, re-read live
+ *                      (the automatic controller, when active, chooses the MCS instead)
+ *   /data/adb/mosey-extended/amsdu    "auto" (default), "off", or frames per A-MSDU (2-7)
  *   MOSEYNEX_LOG       log file                           (default /data/local/tmp/moseynex.log)
  */
 #define _GNU_SOURCE
@@ -54,6 +56,7 @@
 
 #define WLC_IOCTL_MAGIC        0x14e46c77
 #define WLC_SET_VAR            263
+#define WLC_SET_SCANSUPPRESS   116
 #define NEX_INJECT_FRAME       408
 #define NEX_SET_MONITOR_CHSPEC 0x613   /* bcm4375b1 nexmon: monitor on the wlc owning the chanspec */
 #define PRIV_CMD_IOCTL         (SIOCDEVPRIVATE + 1)
@@ -204,6 +207,8 @@ static void moseynex_init_once(void)
     g_log = fopen(env_or("MOSEYNEX_LOG", "/data/local/tmp/moseynex.log"), "a");
 }
 
+static void suppress_scan(uint32_t on);
+
 /* Hooks can run before the constructor (another library's initializer). Nothing inside the once
  * may reach a hook: bionic stdio flushes through write(), so no logging there. */
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
@@ -217,6 +222,7 @@ __attribute__((constructor)) static void moseynex_init(void)
 {
     ensure_init();
     logf_("moseynex loaded pid=%d if=%s alias=%s", getpid(), g_if, g_alias);
+    suppress_scan(0);                    /* left on if the previous daemon died in a session */
 }
 
 static enum fd_kind fd_kind(int fd)
@@ -272,17 +278,30 @@ static bool capture_open(void)
     return false;
 }
 
+/* Android keeps scanning while the station is down for a session. Each scan takes the radio off
+ * the AWDL channel and nothing is received until it is tuned again (S10e: the peer stayed
+ * invisible, transfers moved once a second). Scans are suppressed while the monitor is armed.
+ * module/monwatch.sh and service.sh clear this too if the daemon dies. */
+static void suppress_scan(uint32_t on)
+{
+    if (nex_ioctl(WLC_SET_SCANSUPPRESS, &on, sizeof(on), true) < 0)
+        logf_("scan suppress %u failed (errno=%d)", on, errno);
+}
+
 static void arm_monitor(void)
 {
     /* bcm4375 is RSDB: nexmon's 0x613 binds monitor mode to the core owning the chanspec. It also
      * avoids bcmdhd's own WLC_SET_MONITOR handling, so radiotap frames keep arriving on wlan0. */
     uint32_t mon = (uint32_t)g_monitor;
     pthread_mutex_lock(&g_radio_lock);
+    suppress_scan(1);
     int ret = nex_ioctl(NEX_SET_MONITOR_CHSPEC, &mon, sizeof(mon), true);
     int err = errno;
     if (ret >= 0) {
         g_armed = true;
         dp_enable();
+    } else if (!g_armed) {
+        suppress_scan(0);
     }
     pthread_mutex_unlock(&g_radio_lock);
     if (ret < 0)
@@ -345,6 +364,7 @@ static void disarm_if_idle(void)
         if (ret >= 0)
             g_armed = false;
         logf_("no capture socket left, disarm monitor -> ret=%d", ret);
+        suppress_scan(0);
         dp_disable();
         restore_fw_mac();
     }
@@ -465,6 +485,7 @@ static _Atomic int g_rate_mcs, g_rate_nss;
  * Re-read on ART_TX_RATE and every STAT_EVERY injected frames, so it can change mid-transfer. */
 #define TX_RATE_OVERRIDE "/data/adb/mosey-extended/tx_rate"
 static _Atomic bool g_rate_sgi;
+static _Atomic int g_auto_mcs;           /* chosen by the rate controller; 0: not in use */
 static pthread_mutex_t g_rate_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_rate_req[64];            /* mosey's last request; guarded by g_rate_lock */
 static char g_rate_cur[64];            /* the rate string in effect; guarded by g_rate_lock */
@@ -546,7 +567,10 @@ static size_t rate_radiotap(unsigned char *out)
         out[8] = 0x44;                                      /* known: bandwidth, GI */
         out[10] = g_rate_sgi ? 0x04 : 0;                    /* flags: short GI */
         out[11] = g_bw == 80 ? 4 : g_bw == 40 ? 1 : 0;
-        out[12] = (unsigned char)(g_rate_mcs << 4 | g_rate_nss);
+        int mcs = g_auto_mcs ? g_auto_mcs : g_rate_mcs;
+        if (g_bw == 20 && mcs == 9)      /* VHT MCS 9 does not exist at 20 MHz with 1 or 2 streams */
+            mcs = 8;
+        out[12] = (unsigned char)(mcs << 4 | g_rate_nss);
         return 20;
     }
     uint32_t present = 1u << 19;                            /* MCS: u8 known, u8 flags, u8 mcs */
@@ -768,6 +792,355 @@ static void mark_dp_busy(bool busy)
     }
 }
 
+/* ---- A-MSDU ----------------------------------------------------------------
+ * Unicast QoS data frames to the same peer go out together as one A-MSDU: one preamble and one
+ * acknowledgement for all of them. The driver refuses frames over 1600 bytes, so the A-MSDU is
+ * handed to the firmware as several packets that it chains together (marked in the radiotap pad
+ * byte). Used when the firmware reports support, unless the file AMSDU_ON says "off". A frame
+ * waits at most AMSDU_WAIT_MS for more. */
+#define AMSDU_ON        "/data/adb/mosey-extended/amsdu"
+#define NEX_AMSDU_STAT  0x61a
+#define AMSDU_MAGIC_N   0x414d5333u       /* firmware joins any number */
+#define AMSDU_MAX_N     7                 /* frames per A-MSDU */
+#define AMSDU_PEER_MAX  11400             /* Apple devices accept 11454 byte frames */
+#define AMSDU_WAIT_MS   2
+#define AMSDU_PART_MAX  1514              /* one netdev packet */
+#define AMSDU_SPLIT     1512              /* the firmware just concatenates: split anywhere */
+#define AMSDU_NEXT      (AMSDU_PART_MAX - 8)  /* payload of a following packet */
+#define AMSDU_TOTAL_MAX(n) ((size_t)(AMSDU_SPLIT + ((n) - 1) * AMSDU_NEXT))
+#define DOT11_QOS_LEN   26
+
+static _Atomic bool g_amsdu;
+static pthread_mutex_t g_am_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_am_cond = PTHREAD_COND_INITIALIZER;
+static unsigned char g_am_buf[AMSDU_PART_MAX];
+static size_t g_am_len, g_am_rl;          /* held frame; 0: none */
+static unsigned long g_am_gen;            /* changes with every held frame */
+static bool g_am_thread;
+static unsigned char g_am_agg[AMSDU_MAX_N * AMSDU_PART_MAX];  /* A-MSDU being built */
+static size_t g_am_agg_len, g_am_last_sf; /* its length; length of its last subframe */
+static int g_am_count, g_am_n = 2;        /* frames held; frames per A-MSDU */
+static unsigned long s_pairs, s_single, s_joined;
+
+static bool am_send(const unsigned char *d, size_t len)
+{
+    if (real_send(g_tx_fd, d, len, 0) == (ssize_t)len)
+        return true;
+    s_fail++;
+    return false;
+}
+
+/* Sends the held frames: a single one unchanged, more as one A-MSDU cut into packets the driver
+ * accepts (the firmware chains them back together). Caller holds g_am_lock. */
+static void am_flush(void)
+{
+    if (!g_am_len)
+        return;
+    if (g_am_count < 2) {
+        am_send(g_am_buf, g_am_len);
+        s_single++;
+    } else {
+        unsigned char part[AMSDU_PART_MAX];
+        size_t n = g_am_agg_len;
+        size_t off = n > AMSDU_SPLIT + 16 ? AMSDU_SPLIT : n - 16;
+        g_am_agg[1] = 0xa1;
+        /* without one part the frame would be garbled: stop there, the firmware drops the
+         * unfinished chain when the next one starts */
+        bool sent = am_send(g_am_agg, off);
+        while (sent && off < n) {
+            size_t rem = n - off, m = rem > AMSDU_NEXT ? AMSDU_NEXT : rem;
+            if (rem > m && rem - m < 16)
+                m = rem - 16;
+            memset(part, 0, 8);
+            part[1] = off + m < n ? 0xa3 : 0xa2;
+            part[2] = 8;
+            memcpy(part + 8, g_am_agg + off, m);
+            sent = am_send(part, 8 + m);
+            off += m;
+        }
+        s_pairs++;
+        s_joined += (unsigned long)g_am_count;
+    }
+    g_am_len = 0;
+    g_am_count = 0;
+}
+
+static void *am_timer(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&g_am_lock);
+    for (;;) {
+        while (!g_am_len)
+            pthread_cond_wait(&g_am_cond, &g_am_lock);
+        unsigned long gen = g_am_gen;
+        struct timespec due;
+        clock_gettime(CLOCK_REALTIME, &due);
+        due.tv_nsec += AMSDU_WAIT_MS * 1000000L;
+        if (due.tv_nsec >= 1000000000L) {
+            due.tv_sec++;
+            due.tv_nsec -= 1000000000L;
+        }
+        while (g_am_len && g_am_gen == gen &&
+               pthread_cond_timedwait(&g_am_cond, &g_am_lock, &due) != ETIMEDOUT) {
+        }
+        if (g_am_len && g_am_gen == gen)
+            am_flush();
+    }
+    return NULL;
+}
+
+/* Writes the A-MSDU subframe of the 802.11 frame h (len bytes): DA, SA, length, payload. */
+static size_t am_subframe(unsigned char *out, const unsigned char *h, size_t len)
+{
+    size_t body = len - DOT11_QOS_LEN;
+    memcpy(out, h + 4, 12);               /* addr1 = DA, addr2 = SA */
+    out[12] = (unsigned char)(body >> 8);
+    out[13] = (unsigned char)body;
+    memcpy(out + 14, h + DOT11_QOS_LEN, body);
+    return 14 + body;
+}
+
+/* Takes a frame (radiotap of rl bytes + 802.11) bound for the data path. Returns true if it was
+ * sent or held here; false: send it as usual (any held frame has already gone first). */
+static bool am_take(const unsigned char *d, size_t len, size_t rl)
+{
+    const unsigned char *h = d + rl;
+    size_t hlen = len - rl;
+    bool fits = rl >= 8 && len <= AMSDU_PART_MAX && hlen > DOT11_QOS_LEN + 8 &&
+                h[0] == 0x88 && h[1] == 0 && !(h[4] & 1) && !(h[24] & 0x80) && d[1] == 0;
+
+    pthread_mutex_lock(&g_am_lock);
+    if (!g_am_thread) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, am_timer, NULL) != 0) {
+            pthread_mutex_unlock(&g_am_lock);
+            return false;
+        }
+        pthread_detach(t);
+        g_am_thread = true;
+    }
+    if (!fits) {
+        am_flush();
+        pthread_mutex_unlock(&g_am_lock);
+        return false;
+    }
+    /* join the held frames if the rate header, the three addresses and the QoS TID match and
+     * the result still fits */
+    size_t body = hlen - DOT11_QOS_LEN;
+    if (fits && g_am_len && g_am_rl == rl && memcmp(g_am_buf, d, rl) == 0 &&
+        memcmp(g_am_buf + rl + 4, h + 4, 18) == 0 && g_am_buf[rl + 24] == h[24]) {
+        if (g_am_count == 1) {
+            size_t n = rl + DOT11_QOS_LEN;
+            memcpy(g_am_agg, g_am_buf, n);
+            g_am_agg[rl + 24] |= 0x80;     /* QoS control: A-MSDU present */
+            g_am_last_sf = am_subframe(g_am_agg + n, g_am_buf + rl, g_am_len - rl);
+            g_am_agg_len = n + g_am_last_sf;
+        }
+        size_t pad = (4 - g_am_last_sf % 4) % 4;
+        if (g_am_agg_len + pad + 14 + body <= AMSDU_TOTAL_MAX(g_am_n) &&
+            g_am_agg_len - rl + pad + 14 + body <= AMSDU_PEER_MAX) {
+            memset(g_am_agg + g_am_agg_len, 0, pad);
+            g_am_agg_len += pad;
+            g_am_last_sf = am_subframe(g_am_agg + g_am_agg_len, h, hlen);
+            g_am_agg_len += g_am_last_sf;
+            if (++g_am_count >= g_am_n)
+                am_flush();
+            pthread_mutex_unlock(&g_am_lock);
+            return true;
+        }
+    }
+    am_flush();
+    memcpy(g_am_buf, d, len);
+    g_am_len = len;
+    g_am_rl = rl;
+    g_am_count = 1;
+    g_am_gen++;
+    pthread_cond_signal(&g_am_cond);
+    pthread_mutex_unlock(&g_am_lock);
+    return true;
+}
+
+/* ---- automatic rate and A-MSDU size ---------------------------------------
+ * Large frames go out as RTS, CTS, data, ACK. A CTS shows the peer was listening, so the ACKs
+ * received per CTS tell how well data frames get through at the current rate and size, whatever
+ * share of the time the peer spends on this channel. Both are raised step by step while that
+ * ratio is high and lowered when it drops; a level that failed is not retried for a while. */
+#define WLC_GET_VAR      262
+#define CNT_MAC_XTLV     0x900            /* "counters": MAC statistics block */
+#define CNT_RXCTS        23               /* CTS frames addressed to us */
+#define CNT_RXACK        24               /* ACK frames addressed to us */
+#define AUTO_PERIOD_US   300000
+#define AUTO_MIN_CTS     15               /* fewer in a period: not enough to judge */
+#define AUTO_MCS_MIN     3
+#define AUTO_MCS_MAX     9
+#define AUTO_HOLD        20               /* good periods before a failed level is tried again */
+
+static _Atomic bool g_auto;
+static bool g_auto_thread;
+static int g_auto_rate = 7, g_auto_size = 3;     /* kept between sessions */
+
+static bool read_cts_ack(uint32_t *cts, uint32_t *ack)
+{
+    static unsigned char b[4096];
+    memset(b, 0, sizeof(b));
+    memcpy(b, "counters", sizeof("counters"));
+    if (nex_ioctl(WLC_GET_VAR, b, sizeof(b), false) < 0)
+        return false;
+    size_t end = 4 + (size_t)(b[2] | b[3] << 8);
+    for (size_t p = 4; p + 4 <= end && end <= sizeof(b);) {
+        unsigned int id = b[p] | b[p + 1] << 8, len = b[p + 2] | b[p + 3] << 8;
+        if (id == CNT_MAC_XTLV && len >= (CNT_RXACK + 1) * 4 && p + 4 + len <= end) {
+            memcpy(cts, b + p + 4 + CNT_RXCTS * 4, 4);
+            memcpy(ack, b + p + 4 + CNT_RXACK * 4, 4);
+            return true;
+        }
+        p += 4 + ((len + 3) & ~3u);
+    }
+    return false;
+}
+
+static void am_set_size(int n)
+{
+    pthread_mutex_lock(&g_am_lock);
+    am_flush();
+    g_am_n = n;
+    pthread_mutex_unlock(&g_am_lock);
+}
+
+static void *auto_thread(void *arg)
+{
+    (void)arg;
+    uint32_t cts0 = 0, ack0 = 0;
+    bool have = false, raise_rate = false;
+    int good = 0, hold_rate = 0, hold_size = 0, max_rate = AUTO_MCS_MAX, max_size = AMSDU_MAX_N;
+    for (;;) {
+        usleep(AUTO_PERIOD_US);
+        if (!g_auto) {
+            have = false;
+            continue;
+        }
+        uint32_t cts, ack;
+        if (!read_cts_ack(&cts, &ack)) {
+            have = false;
+            continue;
+        }
+        uint32_t dc = cts - cts0, da = ack - ack0;
+        cts0 = cts;
+        ack0 = ack;
+        if (!have || dc < AUTO_MIN_CTS || dc > 100000) {
+            have = true;
+            continue;
+        }
+        unsigned int pct = da >= dc ? 100 : da * 100 / dc;
+        int rate = g_auto_rate, size = g_auto_size;
+        if (pct < 75) {
+            /* undo the last kind of step first; shrink as well when almost nothing arrives */
+            if ((raise_rate || size <= 2) && rate > AUTO_MCS_MIN) {
+                max_rate = --rate;
+                hold_rate = 0;
+            } else if (size > 2) {
+                max_size = --size;
+                hold_size = 0;
+            }
+            if (pct < 30) {
+                if (rate > AUTO_MCS_MIN)
+                    max_rate = --rate;
+                if (size > 2)
+                    max_size = --size;
+                hold_rate = hold_size = 0;
+            }
+            raise_rate = !raise_rate;
+            good = 0;
+        } else if (pct >= 90) {
+            if (++hold_rate >= AUTO_HOLD)
+                max_rate = AUTO_MCS_MAX;
+            if (++hold_size >= AUTO_HOLD)
+                max_size = AMSDU_MAX_N;
+            if (++good >= 2) {
+                good = 0;
+                /* take turns, so that a failure points at one of the two */
+                raise_rate = !raise_rate;
+                if (raise_rate && rate >= max_rate)
+                    raise_rate = false;
+                else if (!raise_rate && size >= max_size)
+                    raise_rate = true;
+                if (raise_rate && rate < max_rate)
+                    rate++;
+                else if (!raise_rate && size < max_size)
+                    size++;
+            }
+        } else {
+            good = 0;
+        }
+        if (rate != g_auto_rate || size != g_auto_size) {
+            logf_("auto: MCS %d, %d frames (acked %u of %u)", rate, size, da, dc);
+            g_auto_rate = rate;
+            g_auto_mcs = rate;
+            if (size != g_auto_size) {
+                g_auto_size = size;
+                am_set_size(size);
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Caller holds g_radio_lock, data path just turned on. */
+static void am_enable(void)
+{
+    uint32_t r[4] = { 0 };
+    if (nex_ioctl(NEX_AMSDU_STAT, r, sizeof(r), false) < 0 || r[0] != AMSDU_MAGIC_N)
+        return;
+    /* the file: "auto" (also when missing), "off", or a fixed number of frames per A-MSDU */
+    char word[8] = "auto";
+    FILE *f = fopen(AMSDU_ON, "re");
+    if (f) {
+        if (fscanf(f, "%7s", word) != 1)
+            strcpy(word, "auto");
+        fclose(f);
+    }
+    bool automatic = strcmp(word, "auto") == 0;
+    int n = automatic ? g_auto_size : atoi(word);
+    if (n < 2)
+        return;
+    if (automatic) {
+        if (!g_auto_thread) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, auto_thread, NULL) == 0) {
+                pthread_detach(t);
+                g_auto_thread = true;
+            }
+        }
+        automatic = g_auto_thread;
+    }
+    if (n > AMSDU_MAX_N)
+        n = AMSDU_MAX_N;
+    pthread_mutex_lock(&g_am_lock);
+    g_am_n = n;
+    pthread_mutex_unlock(&g_am_lock);
+    g_auto_mcs = automatic ? g_auto_rate : 0;
+    g_auto = automatic;
+    g_amsdu = true;
+    logf_("amsdu: on, %d frames%s", n, automatic ? ", automatic rate and size" : "");
+}
+
+static void am_disable(void)
+{
+    if (!g_amsdu)
+        return;
+    g_auto = false;
+    g_auto_mcs = 0;
+    g_amsdu = false;
+    pthread_mutex_lock(&g_am_lock);
+    g_am_len = 0;
+    g_am_count = 0;
+    pthread_mutex_unlock(&g_am_lock);
+    uint32_t r[4] = { 0 };
+    nex_ioctl(NEX_AMSDU_STAT, r, sizeof(r), false);
+    logf_("amsdu: off (host sent=%lu singles=%lu joined=%lu; fw sent=%u dropped heads=%u tails=%u)",
+          s_pairs, s_single, s_joined, r[1], r[2], r[3]);
+}
+
 /* Turns the data path on after a successful arm, if firmware and module support it.
  * Caller holds g_radio_lock. */
 static void dp_enable(void)
@@ -802,6 +1175,7 @@ static void dp_enable(void)
         return;
     }
     g_dp_on = true;
+    am_enable();
     logf_("datapath: on (fw stat calls=%u injected=%u)", st[0], st[7]);
 }
 
@@ -811,6 +1185,7 @@ static void dp_disable(void)
     if (!g_dp_on)
         return;
     g_dp_on = false;
+    am_disable();
     write_dp_link(0);
     mark_dp_busy(false);
     uint32_t st[8] = { 0 };
@@ -826,8 +1201,21 @@ static long long now_ns(void)
     return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
+static long long s_big_ns, s_gap_ns, s_gap_max;
+static unsigned int s_gaps;
+
 static void tx_stats(size_t bytes, long long t0, long long t1, bool ok)
 {
+    if (bytes >= 1000) {                 /* pauses of 50 ms to 2 s between large frames */
+        long long gap = t0 - s_big_ns;
+        if (s_big_ns && gap > 50000000LL && gap < 2000000000LL) {
+            s_gaps++;
+            s_gap_ns += gap;
+            if (gap > s_gap_max)
+                s_gap_max = gap;
+        }
+        s_big_ns = t1;
+    }
     if (s_frames == 0)
         s_win_ns = t0;
     s_frames++;
@@ -838,9 +1226,12 @@ static void tx_stats(size_t bytes, long long t0, long long t1, bool ok)
     if (s_frames == STAT_EVERY) {
         double secs = (t1 - s_win_ns) / 1e9;
         logf_("inject %d frames in %.2fs: %.1f fps, %.1f KB/s, avg len=%lu, call avg=%lluus, "
-              "datapath=%lu, fail=%lu",
+              "datapath=%lu, fail=%lu, pauses=%u (%lld ms, max %lld ms)",
               STAT_EVERY, secs, STAT_EVERY / secs, s_bytes / secs / 1024.0, s_bytes / STAT_EVERY,
-              (unsigned long long)(s_call_ns / STAT_EVERY / 1000), s_dp, s_fail);
+              (unsigned long long)(s_call_ns / STAT_EVERY / 1000), s_dp, s_fail, s_gaps,
+              s_gap_ns / 1000000, s_gap_max / 1000000);
+        s_gaps = 0;
+        s_gap_ns = s_gap_max = 0;
         s_frames = s_fail = s_bytes = s_dp = 0;
         reload_tx_rate();
         s_call_ns = 0;
@@ -861,7 +1252,8 @@ static ssize_t inject(const void *buf, size_t len)
     if (rl + 24 <= len) {
         track_tx_mac(b + rl + 10);                   /* 802.11 addr2 */
         is_data = ((b[rl] >> 2) & 3) == 2;
-        if (is_data)                                 /* use mosey's data rate */
+        /* the data rate is for unicast: group frames (discovery) keep mosey's robust rate */
+        if (is_data && !(b[rl + 4] & 1))
             hl = rate_radiotap((unsigned char *)f->data);
     }
     size_t flen = len;
@@ -875,6 +1267,11 @@ static ssize_t inject(const void *buf, size_t len)
     long long t0 = now_ns();
     /* MOSEYNEX_DATAPATH=2 keeps management/action frames on the ioctl path (with that
      * split the peer never accepted the TCP connect, so the default sends everything one way). */
+    if (g_dp_on && g_amsdu && hl && am_take((const unsigned char *)f->data, flen, hl)) {
+        s_dp++;
+        tx_stats(len, t0, now_ns(), true);
+        return (ssize_t)len;
+    }
     if (g_dp_on && (g_dp_mode != 2 || is_data)) {
         if (real_send(g_tx_fd, f->data, flen, 0) == (ssize_t)flen) {
             s_dp++;
