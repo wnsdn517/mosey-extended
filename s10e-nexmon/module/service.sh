@@ -43,13 +43,11 @@ else
   log "WARNING: nexmon firmware not mounted (see /data/local/tmp/mosey-s10e.log) - AirDrop radio unavailable"
   RADIO=0
 fi
-# mosey_dhd.ko enables fast transfer (data-path injection). It is tried on any kernel; the kernel
-# refuses an incompatible module. After a load error, or if the phone went down while the fast path
-# was in use (dp_busy left behind), slow mode is pinned for this kernel release. Delete
-# $LOGDIR/slow_mode to try again.
-DPLINK=/sys/module/mosey_dhd/parameters/link
-KO=$MODDIR/kmod/mosey_dhd.ko
+# Fast transfer needs only the firmware. If the phone went down while it was in use (dp_busy left
+# behind), slow mode is pinned for this kernel release; moseynex then leaves the data path off.
+# Delete $LOGDIR/slow_mode to try again.
 SLOW=$LOGDIR/slow_mode
+[ -f $SLOW ] && [ "$(cat $SLOW)" != "$(uname -r)" ] && rm -f $SLOW
 # the previous boot ended in a crash: save a report (with the kernel log) after the first unlock
 if [ -f $LOGDIR/dp_busy ] ||
    grep -a -q -F "Kernel panic" /proc/last_kmsg /sys/fs/pstore/*ramoops* 2>/dev/null; then
@@ -62,18 +60,6 @@ if [ -f $LOGDIR/dp_busy ]; then
   echo off > $LOGDIR/amsdu    # frame bundling stays off until the module is installed again
   log "WARNING: last boot ended while fast transfer was in use - slow mode pinned, A-MSDU off"
 fi
-if [ "$RADIO" = 1 ] && [ -f "$KO" ] && [ ! -e $DPLINK ] &&
-   [ "$(cat $SLOW 2>/dev/null)" != "$(uname -r)" ]; then
-  touch $LOGDIR/dp_busy; sync
-  if insmod "$KO" 2>>$LOGFILE; then
-    log "mosey_dhd loaded"
-  else
-    uname -r > $SLOW
-    log "WARNING: mosey_dhd insmod failed - slow mode pinned"
-  fi
-  rm -f $LOGDIR/dp_busy
-fi
-
 # MoseyApp: must stay enabled and out of app standby; never cleared or reinstalled here
 if pm path com.google.android.mosey >/dev/null 2>&1; then
   pm enable com.google.android.mosey >/dev/null 2>&1
@@ -109,7 +95,6 @@ supervise() {
     # moseynex disarms itself only while it runs. If it died, monitor mode stays armed and blocks
     # 5 GHz STA, and Wi-Fi scans stay suppressed, so undo both here.
     [ "$RADIO" = 1 ] && "$WL" set 0x613 0 >/dev/null 2>&1 && "$WL" set 116 0 >/dev/null 2>&1
-    [ -e $DPLINK ] && echo 0 > $DPLINK
     rm -f $LOGDIR/dp_busy     # only the daemon exited, the phone did not go down
     log "mosey_server exited rc=$rc after ${up}s"
     tail -n 20 $RUNLOG >> $LOGFILE 2>/dev/null

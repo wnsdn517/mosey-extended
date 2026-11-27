@@ -57,18 +57,8 @@ $fw = Join-Path $here 'nexmon\out\bcmdhd_nex.bin_b1'
 if (-not (Test-Path $fw)) { throw "missing $fw (run nexmon\build_fw.sh in WSL)" }
 Copy-Item $fw "$stage\firmware\"
 Copy-Item "$here\tools\wlmon" "$stage\tools\"
-# optional: data-path injection kernel module (kmod\, built in WSL against the device kernel)
-$ko = Join-Path $here 'kmod\out\mosey_dhd.ko'
-if (Test-Path $ko) {
-    New-Item -ItemType Directory -Force "$stage\kmod" | Out-Null
-    Copy-Item $ko "$stage\kmod\"
-    # debug info carries the build machine's paths: never ship it
-    & (Join-Path $Ndk 'toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-strip.exe') --strip-debug "$stage\kmod\mosey_dhd.ko"
-    if ($LASTEXITCODE) { throw 'strip failed' }
-} else { Write-Warning "no ${ko}: module ships without data-path injection" }
-
 # 5. scripts (standalone; mosey_flag.sh writes phenotype flag 45704091)
-foreach ($f in 'module.prop', 'customize.sh', 'post-fs-data.sh', 'service.sh', 'mosey_flag.sh', 'monwatch.sh', 'status.sh', 'report.sh', 'action.sh') {
+foreach ($f in 'module.prop', 'customize.sh', 'post-fs-data.sh', 'service.sh', 'mosey_flag.sh', 'monwatch.sh', 'status.sh', 'report.sh', 'action.sh', 'uninstall.sh') {
     [IO.File]::WriteAllText("$stage\$f", ([IO.File]::ReadAllText("$here\module\$f") -replace "`r`n", "`n"))
 }
 # ksud's sepolicy parser rejects some comment text: ship the rules only

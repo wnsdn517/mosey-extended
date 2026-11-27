@@ -749,15 +749,17 @@ int close(int fd)
 
 /* Two injection paths:
  *   data path  the frame (radiotap + 802.11) is sent as a raw packet on g_if. bcmdhd queues it
- *              on a flow ring (mosey_dhd.ko forces the link up so the ring exists while
- *              unassociated); the nexmon datapath hook fetches the host part of the packet
- *              (hnd_pktfetch) and injects it. A few us per frame.
+ *              on a flow ring (the firmware reports a link when the monitor is armed, so the ring
+ *              exists while unassociated); the nexmon datapath hook fetches the host part of the
+ *              packet (hnd_pktfetch) and injects it. A few us per frame.
  *   ioctl      one NEX_INJECT_FRAME per frame, a ~2.3 ms round trip. Requests are truncated at
  *              ~1.8 KB, so frames cannot be batched. Used when the data path is unavailable and
  *              for any frame the data path refuses. */
 #define STAT_EVERY 500
-#define DP_LINK_PARAM "/sys/module/mosey_dhd/parameters/link"
 #define DP_BUSY       "/data/adb/mosey-extended/dp_busy"
+#define NEX_LINK_STAT 0x61b             /* the firmware reports a link by itself */
+#define NEX_LINK_MAGIC 0x4c494e4bu
+#define SLOW_MODE     "/data/adb/mosey-extended/slow_mode"  /* written after a crash */
 #define NEX_DP_STAT   0x614             /* datapath firmware: diag counters, absent otherwise */
 
 static unsigned long s_frames, s_fail, s_bytes, s_dp;
@@ -765,17 +767,6 @@ static long long s_win_ns, s_call_ns;
 
 static _Atomic bool g_dp_on;            /* changed with g_radio_lock held */
 static int g_tx_fd = -1;
-
-static bool write_dp_link(int v)
-{
-    int fd = open(DP_LINK_PARAM, O_WRONLY | O_CLOEXEC);
-    if (fd < 0)
-        return false;
-    char c = v ? '1' : '0';
-    bool ok = real_write(fd, &c, 1) == 1;
-    real_close(fd);
-    return ok;
-}
 
 /* On disk while the data path is on. If the phone goes down in that time the file survives, and
  * the module's service.sh pins slow mode. */
@@ -1145,11 +1136,15 @@ static void am_disable(void)
  * Caller holds g_radio_lock. */
 static void dp_enable(void)
 {
-    if (!g_dp_allowed || g_dp_on)
+    if (!g_dp_allowed || g_dp_on || access(SLOW_MODE, F_OK) == 0)
         return;
-    uint32_t st[8];
+    uint32_t st[8], link[2] = { 0 };
     if (nex_ioctl(NEX_DP_STAT, st, sizeof(st), false) < 0) {
         logf_("datapath: firmware has no hook, ioctl injection");
+        return;
+    }
+    if (nex_ioctl(NEX_LINK_STAT, link, sizeof(link), false) < 0 || link[0] != NEX_LINK_MAGIC) {
+        logf_("datapath: firmware reports no link, ioctl injection");
         return;
     }
     if (g_tx_fd < 0) {
@@ -1167,13 +1162,11 @@ static void dp_enable(void)
         }
         g_tx_fd = fd;
     }
-    if (g_tx_fd >= 0)
-        mark_dp_busy(true);
-    if (g_tx_fd < 0 || !write_dp_link(1)) {
-        mark_dp_busy(false);
-        logf_("datapath: unavailable (tx fd %d, errno=%d), ioctl injection", g_tx_fd, errno);
+    if (g_tx_fd < 0) {
+        logf_("datapath: no transmit socket (errno=%d), ioctl injection", errno);
         return;
     }
+    mark_dp_busy(true);
     g_dp_on = true;
     am_enable();
     logf_("datapath: on (fw stat calls=%u injected=%u)", st[0], st[7]);
@@ -1186,7 +1179,6 @@ static void dp_disable(void)
         return;
     g_dp_on = false;
     am_disable();
-    write_dp_link(0);
     mark_dp_busy(false);
     uint32_t st[8] = { 0 };
     nex_ioctl(NEX_DP_STAT, st, sizeof(st), false);

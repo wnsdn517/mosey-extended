@@ -13,7 +13,7 @@ state() {
   p=$(cat $LOGDIR/mosey_server.pid 2>/dev/null)
   [ -n "$p" ] && [ "$(cat /proc/$p/comm 2>/dev/null)" = "mosey_server" ] || { echo "error:server-not-running"; return; }
   [ -f $LOGDIR/flag_ok ] || { echo "waiting:gms-flag"; return; }
-  [ -e /sys/module/mosey_dhd/parameters/link ] || { echo "working:slow"; return; }
+  [ -f $LOGDIR/slow_mode ] && { echo "working:slow"; return; }
   echo "working"
 }
 

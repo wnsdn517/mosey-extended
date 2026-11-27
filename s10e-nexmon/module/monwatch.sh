@@ -6,7 +6,6 @@
 MODDIR=${0%/*}
 LOGDIR=/data/adb/mosey-extended
 WL=$MODDIR/tools/wlmon
-DPLINK=/sys/module/mosey_dhd/parameters/link
 
 # /proc/net/packet columns: sk RefCnt Type Proto Iface R Rmem User Inode. mosey_server (and a
 # manual tcpdump) capture as root with a non-zero protocol; system sockets have other uids.
@@ -36,7 +35,6 @@ while :; do
   [ $stale -lt 2 ] && continue
   "$WL" set 0x613 0 >/dev/null 2>&1
   "$WL" set 116 0 >/dev/null 2>&1     # scans were suppressed with it
-  [ -e $DPLINK ] && echo 0 > $DPLINK
   echo "$(date '+%m-%d %H:%M:%S') [mosey-s10e] monwatch: disarmed stale monitor (was $((v & 255)), now $("$WL" get 107))" >> $LOGDIR/service.log
   sh $MODDIR/report.sh "stale monitor mode disarmed" >/dev/null
   stale=0

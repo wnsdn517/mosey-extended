@@ -28,7 +28,6 @@ tailf() { [ -f "$1" ] && { sec "$1"; tail -n ${2:-150} "$1"; }; }
 kernel_env() {
   sec kernel
   cat /proc/version
-  echo "module: $(strings $MODDIR/kmod/mosey_dhd.ko 2>/dev/null | grep -m1 '^vermagic=')"
   echo "boot reason: $(getprop sys.boot.reason) $(cat /proc/reset_reason 2>/dev/null)"
   echo "symbols used by the module (names only):"
   grep -wE "module_layout|kallsyms_lookup_name|dhd_update_interface_link_status|g_dhd_pub" \

@@ -239,20 +239,58 @@ index 0000000..b86ef4a
 +__attribute__((at(0x185458, "", CHIP_VER_BCM4375b1, FW_VER_18_41_117_sta)))
 +BLPatch(dngl_xmit_stub, dngl_xmit_stub);
 diff --git a/patches/bcm4375b1/18_41_117_sta/nexmon/src/ioctl.c b/patches/bcm4375b1/18_41_117_sta/nexmon/src/ioctl.c
-index 43c74bc..63eb314 100644
+index 43c74bc..f698a85 100755
 --- a/patches/bcm4375b1/18_41_117_sta/nexmon/src/ioctl.c
 +++ b/patches/bcm4375b1/18_41_117_sta/nexmon/src/ioctl.c
-@@ -68,6 +68,9 @@ struct inject_frame {
+@@ -68,6 +68,10 @@ struct inject_frame {
  };
  
  void *inject_frame(struct wlc_info *wlc, struct sk_buff *p);
 +extern struct wlc_info *nex_wlc;
 +extern unsigned int nex_dp_stat[8];
 +extern unsigned int nex_amsdu_stat[3];
++static unsigned int nex_link_events = 0;
  
  uint8_t eapol1[] = {
    0x08, 0x02, 0x3a, 0x01, 0x82, 0x3e, 0x7a, 0x30, 0x6c, 0xa8, 0x64, 0x66,
-@@ -216,6 +219,7 @@ wlc_ioctl_hook(struct wlc_info *wlc, int cmd, char *arg, int len, void *wlc_if)
+@@ -208,6 +212,36 @@ typedef struct {
+ 
+ extern hndrte_log_t active_log;
+ 
++/* The Wi-Fi driver queues host frames only while it believes the interface is linked. The station
++ * is down during a session, so the firmware reports a link itself: the driver's own event packet,
++ * with a bsscfg index that no interface has, so that only the driver's transmit queue reacts and
++ * cfg80211 (Android) ignores it. No link-down is sent: the driver gets real ones from the firmware
++ * whenever the station disconnects, which also happens at the start of every session. */
++static void
++nex_link_event(struct wlc_info *wlc)
++{
++    static const unsigned char ev[74] = {
++        0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0,  0x88, 0x6c,       /* Ethernet, type BRCM */
++        0x80, 0x01,  0x00, 0x40,  0x00,  0x00, 0x10, 0x18,  0x00, 0x01,   /* vendor header: event */
++        0x00, 0x02,  0x00, 0x01,                                /* version 2, flags: link up */
++        0, 0, 0, 16,                                            /* WLC_E_LINK */
++        0, 0, 0, 0,  0, 0, 0, 0,  0, 0, 0, 0,  0, 0, 0, 0,      /* status, reason, auth, datalen */
++        0, 0, 0, 0, 0, 0,                                       /* station address */
++        'w', 'l', 'a', 'n', '0', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++        0, 0x1f,                                                /* ifidx, bsscfgidx */
++        0, 0                                                    /* event data padding */
++    };
++    struct wl_info *wl = wlc->wl;
++    struct sk_buff *p = pkt_buf_get_skb(wlc->osh, TXOFF + sizeof(ev));
++
++    if (!p)
++        return;
++    skb_pull(p, TXOFF);
++    memcpy(p->data, (void *) ev, sizeof(ev));
++    wl->dev->chained->funcs->xmit(wl->dev, wl->dev->chained, p);
++    nex_link_events++;
++}
++
+ int
+ wlc_ioctl_hook(struct wlc_info *wlc, int cmd, char *arg, int len, void *wlc_if)
+ {
+@@ -216,6 +250,7 @@ wlc_ioctl_hook(struct wlc_info *wlc, int cmd, char *arg, int len, void *wlc_if)
  
      int ret = IOCTL_ERROR;
      argprintf_init(arg, len);
@@ -260,10 +298,18 @@ index 43c74bc..63eb314 100644
  
      switch (cmd) {
          case NEX_INJECT_FRAME:
-@@ -276,6 +280,21 @@ wlc_ioctl_hook(struct wlc_info *wlc, int cmd, char *arg, int len, void *wlc_if)
+@@ -276,6 +311,29 @@ wlc_ioctl_hook(struct wlc_info *wlc, int cmd, char *arg, int len, void *wlc_if)
              break;
          }
  
++        case 0x61B:   /* link events: magic (the host needs no kernel module), events sent */
++            if (len >= 8) {
++                unsigned int r[2] = { 0x4c494e4b, nex_link_events };
++                memcpy(arg, r, sizeof(r));
++                ret = IOCTL_SUCCESS;
++            }
++            break;
++
 +        case 0x61A:   /* A-MSDU support: magic, pairs sent, heads dropped, tails dropped */
 +            if (len >= 16) {
 +                unsigned int r[4] = { 0x414d5333, nex_amsdu_stat[0], nex_amsdu_stat[1], nex_amsdu_stat[2] };
@@ -282,3 +328,12 @@ index 43c74bc..63eb314 100644
          case WLC_SET_MONITOR:
          case 0x613:
          {
+@@ -292,6 +350,8 @@ wlc_ioctl_hook(struct wlc_info *wlc, int cmd, char *arg, int len, void *wlc_if)
+                 wlc_for_chanspec->pub->tunables->copycount = 2;
+             }
+             path_to_wl_set_monitor(wlc_for_chanspec, *(uint32_t *) arg);
++            if (*(uint32_t *) arg != 0)
++                nex_link_event(wlc);
+ 
+             ret = IOCTL_SUCCESS;
+ 
