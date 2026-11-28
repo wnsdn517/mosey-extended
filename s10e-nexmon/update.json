@@ -1,6 +1,6 @@
 {
-  "version": "0.8",
-  "versionCode": 8,
-  "zipUrl": "https://github.com/wnsdn517/mosey-extended/releases/download/v0.8/mosey-s10e-v0.8.zip",
+  "version": "0.9",
+  "versionCode": 9,
+  "zipUrl": "https://github.com/wnsdn517/mosey-extended/releases/download/v0.9/mosey-s10e-v0.9.zip",
   "changelog": "https://raw.githubusercontent.com/wnsdn517/mosey-extended/main/s10e-nexmon/CHANGELOG.md"
 }

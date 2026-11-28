@@ -1,4 +1,4 @@
-## 0.9 (pre-release)
+## 0.9
 - ROMs with their own MoseyApp: it is hidden while the module is active, so the bundled app gets its Wi-Fi permissions
 - If the app still cannot take the phone off Wi-Fi, the module does it for the session
 - Google Play services flag: waits for the database and retries
