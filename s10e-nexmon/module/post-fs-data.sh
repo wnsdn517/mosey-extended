@@ -125,6 +125,16 @@ V=$MODDIR/vendor; [ -d "$V" ] || V=$MODDIR/system/vendor
 P=$MODDIR/product; [ -d "$P" ] || P=$MODDIR/system/product
 
 ovl "$V/etc/vintf/manifest" /vendor/etc/vintf/manifest
+# rebuilt from the running ROM's file on every boot: a ROM update must not get the old copy
+VSC=/vendor/etc/selinux/vendor_service_contexts
+if [ -f $VSC ] && ! grep -q " $VSC " /proc/mounts; then
+  new=$V/etc/selinux/vendor_service_contexts
+  mkdir -p "${new%/*}"
+  { grep -v moseyservice $VSC
+    echo "com.google.pixel.moseyservice.IMoseyService/default u:object_r:mosey_service:s0"
+  } > "$new"
+  chmod 0644 "$new"
+fi
 bindf "$V/etc/selinux/vendor_service_contexts" /vendor/etc/selinux/vendor_service_contexts
 ovl "$P/priv-app" /product/priv-app
 ovl "$P/etc/permissions" /product/etc/permissions

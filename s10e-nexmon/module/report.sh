@@ -1,12 +1,14 @@
 #!/system/bin/sh
-# report.sh [reason]: collects diagnostics into one file in Download. Runs automatically when the
+# report.sh [reason]: collects diagnostics into one archive in Download: report.txt and the
+# phone's Wi-Fi firmware (needed to port to another model or firmware). Runs automatically when the
 # installer aborts or something fails, and from the module's Action button. The file stays on the
-# phone; nothing is sent anywhere. MAC and local IP addresses, Wi-Fi names, device names and mail
-# addresses are masked, but check the file before sharing it.
+# phone; nothing is sent anywhere. In report.txt MAC and local IP addresses, Wi-Fi names, device
+# names and mail addresses are masked, but check it before sharing.
 MODDIR=${0%/*}
 LOGDIR=/data/adb/mosey-extended
-OUT=${OUT:-/sdcard/Download/mosey-report.txt}
-FW=/vendor/firmware/bcmdhd_sta.bin_b1
+OUT=${OUT:-/sdcard/Download/mosey-report.tar.gz}
+TMP=${RTMP:-/data/local/tmp}/mosey-report.$$
+INSTALLED=/data/adb/modules/mosey-s10e
 LASTK=${LASTK:-/proc/last_kmsg}      # Samsung: kernel log of the previous boot
 
 mask() {
@@ -24,14 +26,44 @@ mask() {
 sec() { echo; echo "== $*"; }
 tailf() { [ -f "$1" ] && { sec "$1"; tail -n ${2:-150} "$1"; }; }
 
-# what is needed to rebuild the kernel module for another kernel, or to see why it was refused
+# Wi-Fi firmware images (the location differs between models and ROMs)
+fw_files() { ls /vendor/firmware/bcmdhd*.bin* /vendor/etc/wifi/bcmdhd*.bin* 2>/dev/null; }
+sha_of() { sha256sum "$1" 2>/dev/null | cut -c1-64; }
+
+wifi_info() {
+  sec firmware
+  for f in $(fw_files); do
+    echo "$(sha_of $f) $(wc -c < $f) $f"
+    tail -c 256 $f | tr -c '[:print:]' '\n' | grep -a -F Version
+  done
+  grep -E "bcmdhd|/vendor/firmware" /proc/mounts | cut -c1-120
+  sec "wifi driver"
+  for p in /sys/module/dhd*/parameters/firmware_path /sys/module/dhd*/parameters/nvram_path \
+           /sys/module/firmware_class/parameters/path; do
+    [ -r $p ] && echo "$p=$(cat $p)"
+  done
+  # chip firmware actually running
+  [ -x $INSTALLED/tools/wlmon ] && $INSTALLED/tools/wlmon var ver 2>&1 | head -n 3
+  ls -l /vendor/etc/wifi 2>/dev/null
+}
+
+# adds the firmware images to the archive; this module's own patched image is left out
+copy_fw() {
+  own="$(sha_of $INSTALLED/firmware/bcmdhd_nex.bin_b1) $(sha_of $MODDIR/firmware/bcmdhd_nex.bin_b1)"
+  for f in $(fw_files); do
+    s=$(sha_of $f)
+    case " $own " in *" $s "*) echo "not included (patched by this module): $f"; continue ;; esac
+    cp $f "$TMP/mosey-report/$(echo ${f#/} | tr / _)" && echo "included: $f" || echo "copy failed: $f"
+  done
+}
+
+# what is needed to port to another kernel, or to see why something was refused
 kernel_env() {
   sec kernel
   cat /proc/version
   echo "boot reason: $(getprop sys.boot.reason) $(cat /proc/reset_reason 2>/dev/null)"
-  echo "symbols used by the module (names only):"
-  grep -wE "module_layout|kallsyms_lookup_name|dhd_update_interface_link_status|g_dhd_pub" \
-    /proc/kallsyms 2>/dev/null | cut -d' ' -f2-
+  echo "selinux: $(getenforce 2>/dev/null)"
+  echo "cpu: $(grep -m1 Features /proc/cpuinfo 2>/dev/null)"
   lsmod 2>/dev/null
 }
 
@@ -56,14 +88,14 @@ crash_dump() {
 collect() {
   echo "mosey-s10e report: $* ($(date '+%Y-%m-%d %H:%M:%S'))"
   sec device
-  for p in ro.product.model ro.product.device ro.hardware.chipname ro.build.version.sdk \
-           ro.build.version.sep ro.build.display.id; do echo "$p=$(getprop $p)"; done
+  for p in ro.product.model ro.product.device ro.hardware.chipname ro.board.platform \
+           ro.build.version.sdk ro.build.version.sep ro.build.version.oneui ro.build.display.id; do
+    echo "$p=$(getprop $p)"
+  done
   uname -r
   echo "root: ksu=$(/data/adb/ksud -V 2>/dev/null)"
   kernel_env
-  sec firmware
-  sha256sum $FW 2>&1
-  grep " $FW " /proc/mounts | cut -c1-120
+  wifi_info
   sec apps
   for p in com.samsung.android.app.sharelive com.google.android.mosey com.google.android.gms; do
     echo "$p $(dumpsys package $p 2>/dev/null | grep -m2 versionName | tr -s ' ' | tr '\n' ' ')"
@@ -72,7 +104,7 @@ collect() {
   for m in /data/adb/modules/*; do
     echo "${m##*/} $([ -f $m/disable ] && echo disabled) $([ -f $m/update ] && echo update-pending)"
   done
-  grep -E "^(version|description)=" /data/adb/modules/mosey-s10e/module.prop 2>/dev/null
+  grep -E "^(version|description)=" $INSTALLED/module.prop 2>/dev/null
   sec state
   ls $LOGDIR 2>/dev/null | tr '\n' ' '; echo
   echo "slow_mode=$(cat $LOGDIR/slow_mode 2>/dev/null) bootloop=$(cat $LOGDIR/bootloop 2>/dev/null)"
@@ -102,7 +134,11 @@ collect() {
 }
 
 mkdir -p "${OUT%/*}" 2>/dev/null
-collect "$*" 2>&1 | mask > "$OUT" 2>/dev/null || exit 1
+trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$TMP/mosey-report" || exit 1
+collect "$*" 2>&1 | mask > "$TMP/mosey-report/report.txt" 2>/dev/null || exit 1
+{ sec "files in this archive"; copy_fw; } >> "$TMP/mosey-report/report.txt" 2>&1
+tar -czf "$OUT" -C "$TMP" mosey-report || exit 1
 chmod 0660 "$OUT" 2>/dev/null
 # make it show up in the Files app
 case $OUT in /sdcard/*)

@@ -1,6 +1,7 @@
 id=mosey-s10e
 name=Quick Share AirDrop for S10
-version=0.7
-versionCode=7
+version=0.8
+versionCode=8
 author=wnsdn517 (forked from lok1s)
 description=Send files to Apple devices with Quick Share
+updateJson=https://raw.githubusercontent.com/wnsdn517/mosey-extended/main/s10e-nexmon/update.json

@@ -20,7 +20,8 @@ esac
 soc="$(getprop ro.hardware.chipname) $(getprop ro.product.board) $(getprop ro.board.platform)"
 case "$soc" in
   *9820*) ;;
-  *) fail "Abort: Exynos 9820 (Galaxy S10 series) only, found: $soc" ;;
+  # not fatal: custom ROMs change these props, and the firmware check below is what matters
+  *) ui_print "  Warning: tested on Exynos 9820 (Galaxy S10 series) only, found: $soc" ;;
 esac
 [ "$API" -ge 36 ] || fail "Abort: Android 16+ required (API $API)"
 [ "$API" -gt 36 ] && ui_print "  Warning: tested on Android 16 only (API $API)"
@@ -71,7 +72,11 @@ rm -f /data/adb/mosey-extended/boot_count /data/adb/mosey-extended/bootloop
 rm -f /data/adb/mosey-extended/slow_mode /data/adb/mosey-extended/dp_busy /data/adb/mosey-extended/amsdu
 # SELinux: mosey_server runs in the root manager's own domain (ksu / magisk / ...)
 dom=$(cut -d: -f3 /proc/self/attr/current 2>/dev/null)
-[ -n "$dom" ] || dom=ksu
+# not a root manager domain (e.g. flashed from recovery): use the manager's usual one
+case "$dom" in
+  ''|recovery|shell|*_app*) [ "$KSU" = "true" ] && dom=ksu || dom=magisk ;;
+esac
+ui_print "  SELinux domain: $dom"
 sed -i "s/@ROOTDOM@/$dom/g" $MODPATH/sepolicy.rule
 
 # service_contexts: extend THIS device's file by one line (never ship the Pixel copy)

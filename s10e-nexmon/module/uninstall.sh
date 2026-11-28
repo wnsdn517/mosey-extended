@@ -46,5 +46,5 @@ if [ -f $DB ]; then
 fi
 cmd deviceidle whitelist -com.google.android.mosey >/dev/null 2>&1
 rm -f /data/local/tmp/phenotype-backup-*.db /data/local/tmp/mosey-s10e.log /data/local/tmp/mosey-s10e.log.prev
-rm -f /sdcard/Download/mosey-report.txt
+rm -f /sdcard/Download/mosey-report.txt /sdcard/Download/mosey-report.tar.gz
 rm -rf /data/adb/mosey-extended $WORK

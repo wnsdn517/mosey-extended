@@ -4,6 +4,7 @@ MODDIR=${0%/*}
 echo "Collecting report..."
 if out=$(sh $MODDIR/report.sh manual); then
   echo "Saved: $out"
+  echo "It holds report.txt and the Wi-Fi firmware."
   echo "Check it for personal information before sharing."
 else
   echo "Failed (unlock the phone and retry)"

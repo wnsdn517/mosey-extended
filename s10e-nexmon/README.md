@@ -8,7 +8,7 @@ Forked from [lok1s/mosey-extended](https://github.com/thelok1s/mosey-extended).
 
 | | |
 |---|---|
-| Phone | Galaxy S10 series with Exynos 9820 |
+| Phone | Galaxy S10 series with Exynos 9820 (other models get a warning; the firmware must still match) |
 | System | Android 16 or newer with One UI |
 | Wi-Fi firmware | Stock BCM4375B1 18.41.117 (the installer checks the exact file) |
 | Root | KernelSU (tested with KernelSU Next) |
@@ -122,8 +122,10 @@ Optional files in `/data/adb/mosey-extended/`:
 
 ## Troubleshooting
 
-- Tap the module's **Action** button to save `Download/mosey-report.txt`. It is also saved after
-  failures and kernel crashes. It stays on the phone; check it for personal information before sharing.
+- Tap the module's **Action** button to save `Download/mosey-report.tar.gz`. It is also saved after
+  a failed install, other failures and kernel crashes. It holds `report.txt` (device, Wi-Fi driver and
+  logs) and the phone's Wi-Fi firmware files, which are needed to support other models. It stays on the
+  phone; check it for personal information before sharing.
 - **Apple device not listed:** set AirDrop on it to receive from everyone, keep its screen on, and
   open a new share sheet.
 - **Transfer fails right after "connecting":** try again from a new share sheet with another copy of
@@ -139,6 +141,9 @@ Optional files in `/data/adb/mosey-extended/`:
 | Module zip | PowerShell | `pwsh build.ps1` |
 
 The zip is written to `out/mosey-s10e.zip`.
+
+Root managers look for updates in `update.json`. To publish one, raise `version` and `versionCode` in
+`module/module.prop`, release the zip, then point `update.json` and `CHANGELOG.md` at it.
 
 | Path | Contents |
 |---|---|
