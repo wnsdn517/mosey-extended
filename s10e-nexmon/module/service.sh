@@ -11,6 +11,7 @@ mkdir -p $LOGDIR; chmod 0700 $LOGDIR
 [ -f $MODDIR/disable ] && exit 0
 # the boot completed and stayed up: reset the guard's counter
 ( until [ "$(getprop sys.boot_completed)" = "1" ]; do sleep 5; done
+  rm -f $LOGDIR/hide_try      # the boot got through with the ROM's app hidden
   sleep 120; rm -f $LOGDIR/boot_count ) &
 # keep logs bounded across boots
 for f in $LOGFILE $RUNLOG $LOGDIR/moseynex.log; do
@@ -76,6 +77,14 @@ else
   log "ERROR: com.google.android.mosey not installed (priv-app overlay failed?)"
 fi
 
+# the shim takes the phone off Wi-Fi itself (see moseynex.c); undo that if the daemon is gone
+sta_release() {
+  [ -f $LOGDIR/sta_held ] || return 0
+  cmd wifi stop-restricting-auto-join-to-subscription-id >/dev/null 2>&1 && rm -f $LOGDIR/sta_held &&
+    log "wifi autojoin released" && cmd wifi start-scan >/dev/null 2>&1
+}
+rm -f $LOGDIR/sta_held    # a reboot already undid it
+
 # mosey_server supervisor
 supervise() {
   fails=0
@@ -83,8 +92,13 @@ supervise() {
     if ! ip link show radiotap0 >/dev/null 2>&1; then
       ip link add radiotap0 type dummy && ip link set radiotap0 up
     fi
+    # a ROM with its own MoseyApp may leave the app without the permission to stop autojoin
+    hold=0
+    dumpsys package com.google.android.mosey 2>/dev/null |
+      grep -q -F "MANAGE_WIFI_NETWORK_SELECTION: granted=true" || hold=1
+    [ $hold = 1 ] && log "MoseyApp cannot stop Wi-Fi autojoin: the shim does it"
     t0=$(date +%s)
-    LD_PRELOAD=$SHIM MOSEYNEX_IF=wlan0 MOSEYNEX_ALIAS=radiotap0 MOSEYNEX_LOG=$LOGDIR/moseynex.log \
+    MOSEYNEX_STA_HOLD=$hold LD_PRELOAD=$SHIM MOSEYNEX_IF=wlan0 MOSEYNEX_ALIAS=radiotap0 MOSEYNEX_LOG=$LOGDIR/moseynex.log \
       MOSEYNEX_FFI=$FFI "$BIN" >> $RUNLOG 2>&1 &
     pid=$!
     echo $pid > $PIDFILE
@@ -95,6 +109,7 @@ supervise() {
     # moseynex disarms itself only while it runs. If it died, monitor mode stays armed and blocks
     # 5 GHz STA, and Wi-Fi scans stay suppressed, so undo both here.
     [ "$RADIO" = 1 ] && "$WL" set 0x613 0 >/dev/null 2>&1 && "$WL" set 116 0 >/dev/null 2>&1
+    sta_release
     rm -f $LOGDIR/dp_busy     # only the daemon exited, the phone did not go down
     log "mosey_server exited rc=$rc after ${up}s"
     tail -n 20 $RUNLOG >> $LOGFILE 2>/dev/null

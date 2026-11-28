@@ -81,6 +81,19 @@ Samsung Quick Share ─ Google Play services ─ MoseyApp ─ mosey_server (AWDL
 6. When sharing ends, the library disarms monitor mode, allows scans again and restores the MAC
    address; the phone rejoins its network.
 
+If MoseyApp lacks the permission to stop Wi-Fi autojoin (seen on a ROM that ships its own copy of
+the app), or the phone is still connected, the library takes it off Wi-Fi itself and releases it
+afterwards.
+
+A ROM's own MoseyApp (in `system` or `system_ext`) is hidden while the module is active, so that
+the bundled one gets its permissions. Removing the module brings it back. Create `no_hide_rom_app`
+in the module folder to keep the ROM's app.
+
+Boot protection: the module disables itself on the third start in a row without a completed boot, or
+when a boot is not complete after 10 minutes (then it reboots; the report is kept in
+`/data/adb/mosey-extended/bootloop-report.tar.gz`). If a boot with the ROM's app hidden does not
+finish, the next one leaves that app alone.
+
 ### Why it is fast
 
 - **A-MSDU:** up to seven packets share one transmission and one acknowledgement. The driver rejects

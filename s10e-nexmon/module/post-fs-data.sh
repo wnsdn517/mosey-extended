@@ -39,6 +39,25 @@ fi
 echo $n > $STATE/boot_count
 sync
 
+# boot watchdog: a system that crashes over and over during boot never restarts the kernel, so the
+# count above would not grow. If the boot is not complete after 10 minutes (a first boot after a ROM
+# update is slow), save a report, disable the module and reboot. $MODDIR/no_watchdog turns it off.
+if [ ! -f $MODDIR/no_watchdog ]; then
+  nohup sh -c '
+    t=0
+    while [ "$(getprop sys.boot_completed)" != 1 ]; do
+      sleep 5; t=$((t + 5))
+      [ $t -ge ${BOOT_LIMIT:-600} ] || continue
+      touch "$0/disable"
+      echo "boot not complete after ${t}s: module disabled" > "$1/bootloop"
+      sync
+      OUT="$1/bootloop-report.tar.gz" timeout 90 sh "$0/report.sh" bootloop
+      sync
+      reboot
+      break
+    done' $MODDIR $STATE >/dev/null 2>&1 &
+fi
+
 # resetprop (KernelSU / KernelSU Next / APatch / Magisk)
 RP=""
 for c in /data/adb/ksu/bin/resetprop /data/adb/ap/bin/resetprop /data/adb/magisk/resetprop; do
@@ -64,6 +83,28 @@ else
   fi
 fi
 
+# Everything mounted over the system is copied to tmpfs first: a mount whose source lives on /data
+# keeps /data busy at shutdown (init only unmounts block-device mounts), which forces
+# "Shutdown /data" -> sudden-power-off -> a long full fsck.f2fs on the next boot.
+STAGE=/dev/mosey-s10e
+mkdir -p $STAGE && chmod 0755 $STAGE
+
+label_of() { ls -Zd "$1" 2>/dev/null | awk '{print $1}'; }
+
+# staged <file> <SELinux label>: prints the path to bind-mount, a labelled copy in tmpfs. Falls back
+# to the file itself if the copy or its label does not come out right.
+staged() {
+  t=$STAGE/${1##*/}
+  if cp "$1" "$t" 2>/dev/null && cmp -s "$1" "$t" && chmod 0644 "$t" &&
+     chcon "$2" "$t" 2>/dev/null && [ "$(label_of "$t")" = "$2" ]; then
+    echo "$t"
+  else
+    echo "WARNING: no tmpfs copy of ${1##*/}, mounting the file on /data" >> $LOG
+    chcon "$2" "$1" 2>/dev/null
+    echo "$1"
+  fi
+}
+
 # nexmon firmware, only over the exact stock image it was built from
 if [ -f "$MODDIR/no_nexmon" ]; then
   echo "no_nexmon set, stock firmware" >> $LOG
@@ -74,8 +115,8 @@ elif [ -f "$NEX" ] && [ -f "$FW" ]; then
   echo "stock $FW sha256=$sha" >> $LOG
   case "$sha" in
     "$STOCK_SHA")
-      chcon u:object_r:vendor_fw_file:s0 "$NEX"
-      mount -o bind "$NEX" "$FW" >> $LOG 2>&1 && echo "nexmon firmware bound over $FW" >> $LOG ;;
+      src=$(staged "$NEX" u:object_r:vendor_fw_file:s0)
+      mount -o bind "$src" "$FW" >> $LOG 2>&1 && echo "nexmon firmware bound over $FW from $src" >> $LOG ;;
     *)
       echo "WARNING: $FW is not BCM4375B1 18.41.117 stock; nexmon NOT loaded (AirDrop radio disabled)" >> $LOG
       touch "$MODDIR/.fw_mismatch" ;;
@@ -85,14 +126,6 @@ else
 fi
 
 [ -f "$MODDIR/no_overlay" ] && { echo "no_overlay set, skipping overlays" >> $LOG; exit 0; }
-
-label_of() { ls -Zd "$1" 2>/dev/null | awk '{print $1}'; }
-
-# Overlay lower dirs are copied to tmpfs first: an overlayfs whose lowerdir lives on /data keeps
-# /data busy at shutdown (init only unmounts block-device mounts), which forces "Shutdown /data"
-# -> sudden-power-off -> a long full fsck.f2fs on the next boot.
-STAGE=/dev/mosey-s10e
-mkdir -p $STAGE && chmod 0755 $STAGE
 
 # ovl <module dir> <target dir>: read-only overlay, module files on top of the original directory
 ovl() {
@@ -116,7 +149,7 @@ bindf() {
   src=$1; dst=$2
   [ -f "$src" ] && [ -f "$dst" ] || { echo "skip $dst (missing)" >> $LOG; return; }
   lbl=$(label_of "$dst")
-  [ -n "$lbl" ] && chcon "$lbl" "$src"
+  [ -n "$lbl" ] && src=$(staged "$src" "$lbl")
   mount -o bind "$src" "$dst" >> $LOG 2>&1 && echo "bind $dst ($lbl)" >> $LOG || echo "FAILED bind $dst" >> $LOG
 }
 
@@ -140,3 +173,32 @@ ovl "$P/priv-app" /product/priv-app
 ovl "$P/etc/permissions" /product/etc/permissions
 ovl "$P/etc/default-permissions" /product/etc/default-permissions
 ovl "$P/etc/sysconfig" /product/etc/sysconfig
+
+# A ROM with its own MoseyApp in system or system_ext: Android takes that one as the system copy and
+# ignores ours in /product, so the app misses the permissions to take the phone off Wi-Fi. Hide the
+# ROM's folder behind an empty one. Only once our app and its permission list are really mounted
+# (otherwise the phone would be left without the app). $MODDIR/no_hide_rom_app turns this off.
+# hide_try is cleared once a boot completes (service.sh). Still there: the last boot with the app
+# hidden did not finish, so keep the ROM's app from now on (until the module is installed again).
+if [ -f $STATE/hide_try ]; then
+  touch $MODDIR/no_hide_rom_app
+  rm -f $STATE/hide_try
+  echo "WARNING: the last boot with the ROM app hidden did not complete: not hiding it again" >> $LOG
+fi
+for d in /system_ext/priv-app/*[Mm]osey* /system_ext/app/*[Mm]osey* \
+         /system/priv-app/*[Mm]osey* /system/app/*[Mm]osey*; do
+  [ -d "$d" ] || continue
+  if [ -f "$MODDIR/no_hide_rom_app" ]; then
+    echo "no_hide_rom_app set, keeping $d" >> $LOG
+  elif ! cmp -s "$P/priv-app/MoseyApp/base.apk" /product/priv-app/MoseyApp/base.apk ||
+       [ ! -f /product/etc/permissions/privapp-permissions-mosey.xml ]; then
+    echo "WARNING: our MoseyApp is not mounted, keeping $d" >> $LOG
+  else
+    mkdir -p $STAGE/empty && chmod 0755 $STAGE/empty
+    lbl=$(label_of "$d")
+    [ -n "$lbl" ] && chcon "$lbl" $STAGE/empty
+    touch $STATE/hide_try; sync
+    mount -o bind $STAGE/empty "$d" >> $LOG 2>&1 && echo "hidden ROM app $d" >> $LOG ||
+      echo "FAILED to hide $d" >> $LOG
+  fi
+done

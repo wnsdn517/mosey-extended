@@ -21,6 +21,7 @@ mask() {
     -e 's/(ssid|SSID)([=: ]+)"[^"]*"/\1\2"***"/g' \
     -e "s/(ssid|SSID)=('[^']*'|[^,\") ]+)/\1=***/g" \
     -e 's/([dD]eviceName)=[^,)]*/\1=***/g' \
+    -e 's/(connected to )"[^"]*"/\1"***"/g' \
     -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}/***@***/g'
 }
 sec() { echo; echo "== $*"; }
@@ -45,6 +46,53 @@ wifi_info() {
   # chip firmware actually running
   [ -x $INSTALLED/tools/wlmon ] && $INSTALLED/tools/wlmon var ver 2>&1 | head -n 3
   ls -l /vendor/etc/wifi 2>/dev/null
+}
+
+# the radio right now (meaningful while a share sheet is open)
+radio_now() {
+  sec "wifi state"
+  echo "operstate: $(cat /sys/class/net/wlan0/operstate 2>&1)"
+  # picked lines only: the full output repeats the network name in places the mask does not know
+  cmd wifi status 2>&1 | grep -o -E "^Wifi .*|Supplicant state: [A-Z_]+|Frequency: [0-9]+MHz"
+  echo "location_mode: $(settings get secure location_mode 2>&1)"
+  WL=$INSTALLED/tools/wlmon
+  [ -x $WL ] || return
+  echo "monitor (ioctl 107): $($WL get 107 2>&1)"
+  echo "scan suppress (ioctl 116): $($WL get 116 2>&1)"
+  a=$(cat /sys/class/net/wlan0/statistics/rx_packets 2>/dev/null)
+  sleep 2
+  b=$(cat /sys/class/net/wlan0/statistics/rx_packets 2>/dev/null)
+  echo "rx_packets: $a, 2 s later: $b"
+}
+
+# MoseyApp and anything mosey the ROM ships itself: a ROM copy changes which permission list
+# applies, and without its permissions the app cannot take the phone off Wi-Fi
+mosey_pkg() {
+  sec "mosey files in the ROM"
+  for d in /system /system_ext /product /vendor; do
+    ls -d $d/priv-app/*[Mm]osey* $d/app/*[Mm]osey* $d/bin/*mosey* $d/etc/init/*mosey* \
+      $d/etc/permissions/*mosey* $d/etc/default-permissions/*mosey* $d/etc/sysconfig/*mosey* 2>/dev/null
+  done
+  for f in /system/etc/permissions/*.xml /system_ext/etc/permissions/*.xml /product/etc/permissions/*.xml; do
+    grep -q com.google.android.mosey "$f" 2>/dev/null && { sec "$f"; sed -n '/<!--/,/-->/!p' "$f" |
+      sed -n '/com.google.android.mosey/,/<\/privapp-permissions>/p' | head -n 40; }
+  done
+  sec "mosey package"
+  pm path com.google.android.mosey 2>&1
+  dumpsys package com.google.android.mosey 2>/dev/null |
+    sed -n '/^Packages:/,/^Queries:/p;/^Hidden system packages:/,/^Queries:/p' | head -n 250
+}
+
+# the GMS flag that lets Quick Share use mosey, as stored and as GMS publishes it
+flag_state() {
+  sec "gms flag 45704091"
+  G=/data/data/com.google.android.gms
+  pb=$G/files/phenotype/shared/com.google.android.gms.nearby.pb
+  echo "published: $([ -f $pb ] && grep -q 45704091 $pb && echo yes || echo no)"
+  SQ=$MODDIR/vendor/bin/sqlite3_mosey
+  [ -x $SQ ] || SQ=$INSTALLED/vendor/bin/sqlite3_mosey
+  [ -x $SQ ] && $SQ -readonly -cmd ".timeout 5000" $G/databases/phenotype.db \
+    "select 'override', config_package_id, account_id, value, type from flag_overrides where name='45704091';" 2>&1
 }
 
 # adds the firmware images to the archive; this module's own patched image is left out
@@ -95,7 +143,10 @@ collect() {
   uname -r
   echo "root: ksu=$(/data/adb/ksud -V 2>/dev/null)"
   kernel_env
+  radio_now      # first: the rest takes long enough for a session to end
   wifi_info
+  mosey_pkg
+  flag_state
   sec apps
   for p in com.samsung.android.app.sharelive com.google.android.mosey com.google.android.gms; do
     echo "$p $(dumpsys package $p 2>/dev/null | grep -m2 versionName | tr -s ' ' | tr '\n' ' ')"
@@ -119,10 +170,13 @@ collect() {
   sec dmesg
   dmesg 2>/dev/null | grep -iE "mosey|dhd_|bcmdhd|firmware|version of symbol|version magic|avc: .*(mosey|ksu)|Kernel panic|Unable to handle" | tail -n 150
   sec logcat
+  # lines repeated many times a second are dropped first, or they push everything else out
   logcat -d -b main -b system -b crash -v time 2>/dev/null |
-    grep -F -e Mosey.A -e mosey -e AndroidRuntime -e FATAL -e ExternalSharing \
-      -e "External sharing provider" |    # fixed strings: a regex takes half a minute here
-    tail -n 250
+    grep -F -e Mosey.A -e mosey -e AndroidRuntime -e FATAL -e ShareLive -e NearbySharing \
+      -e ExternalSharing -e "External sharing provider" |  # fixed strings: a regex takes half a minute here
+    grep -v -F -e "without RSSI" -e "A-MSDU subframe" -e "Transceiver task channel is full" \
+      -e StackLog -e I/AndroidRuntime -e D/AndroidRuntime |
+    tail -n 2000
   case "$*" in
     *bootloop*)
       sec "system crashes"
@@ -132,6 +186,12 @@ collect() {
   sec "kernel config"
   zcat /proc/config.gz 2>/dev/null | grep -v "^#" | grep .
 }
+
+# a report that starts by itself runs behind everything else (less heat and stutter, takes longer)
+if [ "$*" != manual ]; then
+  renice -n 19 -p $$ >/dev/null 2>&1
+  ionice -c 3 -p $$ >/dev/null 2>&1
+fi
 
 mkdir -p "${OUT%/*}" 2>/dev/null
 trap 'rm -rf "$TMP"' EXIT

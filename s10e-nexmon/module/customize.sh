@@ -67,7 +67,8 @@ else
   ui_print "  Wi-Fi firmware OK"
 fi
 ui_print "[4/4] Installing"
-rm -f /data/adb/mosey-extended/boot_count /data/adb/mosey-extended/bootloop
+rm -f /data/adb/mosey-extended/boot_count /data/adb/mosey-extended/bootloop \
+  /data/adb/mosey-extended/hide_try
 # try fast mode and frame bundling again
 rm -f /data/adb/mosey-extended/slow_mode /data/adb/mosey-extended/dp_busy /data/adb/mosey-extended/amsdu
 # SELinux: mosey_server runs in the root manager's own domain (ksu / magisk / ...)

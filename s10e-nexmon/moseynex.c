@@ -29,13 +29,16 @@
  *   MOSEYNEX_LOG       log file                           (default /data/local/tmp/moseynex.log)
  */
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>
 #include <netpacket/packet.h>
 #include <pthread.h>
+#include <spawn.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -44,10 +47,12 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <linux/genetlink.h>
 #include <linux/if_arp.h>
+#include <linux/if_ether.h>
 #include <linux/netlink.h>
 #include <linux/nl80211.h>
 #include <linux/sockios.h>
@@ -57,6 +62,8 @@
 #define WLC_IOCTL_MAGIC        0x14e46c77
 #define WLC_SET_VAR            263
 #define WLC_SET_SCANSUPPRESS   116
+#define WLC_GET_BSSID          23
+#define WLC_GET_MONITOR        107
 #define NEX_INJECT_FRAME       408
 #define NEX_SET_MONITOR_CHSPEC 0x613   /* bcm4375b1 nexmon: monitor on the wlc owning the chanspec */
 #define PRIV_CMD_IOCTL         (SIOCDEVPRIVATE + 1)
@@ -288,6 +295,171 @@ static void suppress_scan(uint32_t on)
         logf_("scan suppress %u failed (errno=%d)", on, errno);
 }
 
+/* Diagnostics for the bug report, once per arm and disarm: whether the firmware took the monitor
+ * setting, whether the station is (still or again) associated, which makes it a no-op, and how
+ * many packets the interface has received, to tell "heard nothing" from "no peer". */
+static void log_radio_state(const char *when)
+{
+    uint32_t mon = 0;
+    int mret = nex_ioctl(WLC_GET_MONITOR, &mon, sizeof(mon), false);
+    unsigned char bssid[6] = { 0 };
+    bool assoc = nex_ioctl(WLC_GET_BSSID, bssid, sizeof(bssid), false) >= 0;   /* not logged */
+
+    char path[96], num[32] = "?";
+    snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/rx_packets", g_if);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t r = read(fd, num, sizeof(num) - 1);
+        if (r > 0)
+            num[num[r - 1] == '\n' ? r - 1 : r] = 0;
+        real_close(fd);
+    }
+    logf_("radio %s: monitor=0x%x%s associated=%d rx_packets=%s", when, mon,
+          mret < 0 ? " (read failed)" : "", assoc, num);
+}
+
+/* Fallback for ROMs where MoseyApp lacks the permission to stop Wi-Fi autojoin (a ROM with its
+ * own MoseyApp does not grant it to the updated app): monitor mode is a no-op while the station is
+ * associated, so root takes it off Wi-Fi for the session. Used when service.sh found the
+ * permission missing (MOSEYNEX_STA_HOLD=1) or the station is still associated. The marker file
+ * lets service.sh undo it if the daemon dies; a reboot undoes it too. */
+#define STA_HELD_FILE "/data/adb/mosey-extended/sta_held"
+static pthread_mutex_t g_sta_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_sta_held;
+extern char **environ;
+
+/* "cmd wifi <verb> [arg]" without LD_PRELOAD: a child that loaded the shim would run its
+ * constructor and lift the scan suppression. */
+static int cmd_wifi(const char *verb, const char *arg)
+{
+    char *argv[] = { "/system/bin/cmd", "wifi", (char *)verb, (char *)arg, NULL };
+    size_t n = 0, k = 0;
+    while (environ[n])
+        n++;
+    char *envp[n + 1];
+    for (size_t i = 0; i < n; i++)
+        if (strncmp(environ[i], "LD_PRELOAD=", 11) != 0)
+            envp[k++] = environ[i];
+    envp[k] = NULL;
+    pid_t pid;
+    int st = -1;
+    if (posix_spawn(&pid, argv[0], NULL, NULL, argv, envp) != 0)
+        return -1;
+    while (waitpid(pid, &st, 0) < 0)
+        if (errno != EINTR)
+            return -1;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+static bool sta_associated(void)
+{
+    unsigned char bssid[6] = { 0 };
+    return nex_ioctl(WLC_GET_BSSID, bssid, sizeof(bssid), false) >= 0;
+}
+
+static void sta_hold(void)
+{
+    pthread_mutex_lock(&g_sta_lock);
+    if (!g_sta_held && (atoi(env_or("MOSEYNEX_STA_HOLD", "0")) != 0 || sta_associated())) {
+        int fd = open(STA_HELD_FILE, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+        if (fd >= 0)
+            real_close(fd);
+        /* no network belongs to subscription 9999, so nothing is joined */
+        int rc = cmd_wifi("start-restricting-auto-join-to-subscription-id", "9999");
+        g_sta_held = rc == 0;
+        if (!g_sta_held)
+            unlink(STA_HELD_FILE);
+        logf_("wifi autojoin held by the shim -> rc=%d", rc);
+    }
+    pthread_mutex_unlock(&g_sta_lock);
+}
+
+static void sta_release(void)
+{
+    pthread_mutex_lock(&g_sta_lock);
+    if (g_sta_held) {
+        int rc = cmd_wifi("stop-restricting-auto-join-to-subscription-id", NULL);
+        if (rc == 0) {
+            g_sta_held = false;
+            unlink(STA_HELD_FILE);
+            cmd_wifi("start-scan", NULL);    /* rejoins in seconds instead of half a minute */
+        }
+        logf_("wifi autojoin released -> rc=%d", rc);
+    }
+    pthread_mutex_unlock(&g_sta_lock);
+}
+
+/* Diagnostics: listens next to the daemon for the first seconds of a session and logs only counts:
+ * nothing heard (radio or driver), frames without a signal strength (the daemon drops those),
+ * or AWDL frames from other devices (the radio works; look higher up). */
+#define SNIFF_SECONDS 10
+static atomic_bool g_sniffing;
+
+static void *sniff_thread(void *arg)
+{
+    (void)arg;
+    unsigned int in = 0, out = 0, radiotap = 0, signal = 0, awdl = 0, npeers = 0;
+    unsigned char peers[16][6];
+    int fd = real_socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(ETH_P_ALL));
+    struct sockaddr_ll sll = { .sll_family = AF_PACKET, .sll_protocol = htons(ETH_P_ALL),
+                               .sll_ifindex = (int)real_index() };
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
+    if (fd < 0 || real_bind(fd, (struct sockaddr *)&sll, sizeof(sll)) < 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        logf_("sniff: cannot listen (errno=%d)", errno);
+        goto done;
+    }
+    struct timespec t0, now;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    do {
+        unsigned char b[256];
+        struct sockaddr_ll from = { 0 };
+        socklen_t flen = sizeof(from);
+        ssize_t n = real_recvfrom(fd, b, sizeof(b), 0, (struct sockaddr *)&from, &flen);
+        if (n >= 0 && from.sll_pkttype == PACKET_OUTGOING) {
+            out++;
+        } else if (n >= 0) {
+            in++;
+            unsigned int len = n >= 8 && b[0] == 0 ? (unsigned int)(b[2] | b[3] << 8) : 0;
+            if (len >= 8 && len < (unsigned int)n) {
+                radiotap++;
+                if (b[4] & 0x20)                                 /* dBm antenna signal */
+                    signal++;
+                const unsigned char *f = b + len;
+                /* vendor action frame with Apple's OUI */
+                if ((unsigned int)n >= len + 28 && f[0] == 0xd0 && f[24] == 0x7f &&
+                    f[25] == 0x00 && f[26] == 0x17 && f[27] == 0xf2) {
+                    awdl++;
+                    unsigned int i = 0;
+                    while (i < npeers && memcmp(peers[i], f + 10, 6) != 0)
+                        i++;
+                    if (i == npeers && npeers < 16)
+                        memcpy(peers[npeers++], f + 10, 6);      /* counted, never logged */
+                }
+            }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &now);
+    } while (g_armed && now.tv_sec - t0.tv_sec < SNIFF_SECONDS);
+    logf_("sniff: received=%u sent=%u radiotap=%u with_signal=%u awdl_from_others=%u awdl_devices=%u",
+          in, out, radiotap, signal, awdl, npeers);
+done:
+    if (fd >= 0)
+        real_close(fd);
+    g_sniffing = false;
+    return NULL;
+}
+
+static void start_sniff(void)
+{
+    pthread_t t;
+    if (atomic_exchange(&g_sniffing, true))
+        return;
+    if (pthread_create(&t, NULL, sniff_thread, NULL) == 0)
+        pthread_detach(t);
+    else
+        g_sniffing = false;
+}
+
 static void arm_monitor(void)
 {
     /* bcm4375 is RSDB: nexmon's 0x613 binds monitor mode to the core owning the chanspec. It also
@@ -300,6 +472,8 @@ static void arm_monitor(void)
     if (ret >= 0) {
         g_armed = true;
         dp_enable();
+        log_radio_state("armed");
+        start_sniff();
     } else if (!g_armed) {
         suppress_scan(0);
     }
@@ -359,6 +533,7 @@ static void disarm_if_idle(void)
 {
     pthread_mutex_lock(&g_radio_lock);
     if (g_armed && !capture_open()) {
+        log_radio_state("before disarm");
         uint32_t off = 0;
         int ret = nex_ioctl(NEX_SET_MONITOR_CHSPEC, &off, sizeof(off), true);
         if (ret >= 0)
@@ -369,6 +544,8 @@ static void disarm_if_idle(void)
         restore_fw_mac();
     }
     pthread_mutex_unlock(&g_radio_lock);
+    if (!capture_open())
+        sta_release();                   /* after the disarm: the station can rejoin now */
 }
 
 /* Single timer thread. Sleeps until g_timer_due, then runs disarm_if_idle(). A newer schedule
@@ -449,6 +626,8 @@ static int set_channel(int ch, bool is5g, int bw)
     /* Arming while the firmware is still tearing the link down leaves it delivering mostly
      * garbage frames (S10e: 0.15-0.7 s after the disconnect was bad, 1.5 s and more was clean).
      * Delay before each arm while monitor is off. */
+    if (g_monitor && !g_armed)
+        sta_hold();
     if (g_monitor && !g_armed && g_settle_ms > 0)
         usleep((useconds_t)g_settle_ms * 1000);
 
@@ -468,6 +647,8 @@ static int set_channel(int ch, bool is5g, int bw)
         g_want_monitor = true;
         arm_monitor();
         schedule_disarm(START_DISARM_MS);
+    } else if (ret != 0 && !g_armed) {
+        sta_release();
     }
     return ret;
 }
